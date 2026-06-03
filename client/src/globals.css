@@ -1,0 +1,92 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Base Styles ────────────────────────────────────────── */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+  background: #000408;
+  color: #e2e8f0;
+}
+
+/* ─── Grid Background ────────────────────────────────────── */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(0,180,216,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,180,216,0.03) 1px, transparent 1px);
+  background-size: 50px 50px;
+}
+
+/* ─── Scan Line ──────────────────────────────────────────── */
+body::after {
+  content: '';
+  position: fixed;
+  left: 0;
+  width: 100%;
+  height: 120px;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.4;
+  background: linear-gradient(transparent, rgba(0,180,216,0.04), transparent);
+  animation: scanline 8s linear infinite;
+}
+
+/* ─── Custom Scrollbar ───────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 3px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 180, 216, 0.15);
+  border-radius: 2px;
+}
+
+/* ─── Selection ──────────────────────────────────────────── */
+::selection {
+  background: rgba(0, 180, 216, 0.3);
+  color: #e2e8f0;
+}
+
+/* ─── Focus Styles ───────────────────────────────────────── */
+:focus-visible {
+  outline: 1px solid rgba(0, 180, 216, 0.4);
+  outline-offset: 2px;
+}
+
+/* ─── Utility Classes ────────────────────────────────────── */
+@layer utilities {
+  .glass {
+    backdrop-filter: blur(12px);
+    background: rgba(0, 4, 8, 0.7);
+  }
+  .glass-surface {
+    backdrop-filter: blur(12px);
+    background: rgba(0, 20, 40, 0.6);
+  }
+  .glow-cyan {
+    box-shadow: 0 0 20px rgba(0, 180, 216, 0.2);
+  }
+  .glow-cyan-strong {
+    box-shadow: 0 0 30px rgba(0, 180, 216, 0.3), 0 0 60px rgba(0, 180, 216, 0.15);
+  }
+  .text-glow-cyan {
+    text-shadow: 0 0 10px rgba(0, 180, 216, 0.3);
+  }
+  .border-glow {
+    border-color: rgba(0, 180, 216, 0.15);
+  }
+}

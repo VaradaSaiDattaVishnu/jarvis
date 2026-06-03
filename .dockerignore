@@ -1,0 +1,13 @@
+node_modules/
+client/node_modules/
+.env
+jarvis_memory.db
+.jarvis_key
+.google_token.json
+audio/*.mp3
+logs/
+backups/
+.git/
+.claude/
+BUGS.md
+*.md

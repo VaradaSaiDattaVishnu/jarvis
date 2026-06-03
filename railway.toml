@@ -1,0 +1,25 @@
+# Railway deployment config.
+#
+# IMPORTANT — persistent storage:
+#   The app stores its SQLite DB, encryption key, VAPID keypair, Google token and
+#   backups under DATA_DIR (baked to /data in the Dockerfile). To keep that data
+#   across deploys, add a Volume in the Railway dashboard mounted at: /data
+#   (Service → Settings → Volumes → Mount path: /data). Without a volume the app
+#   still runs, but data is wiped on each redeploy.
+#
+# Recommended service variables (Railway dashboard → Variables):
+#   GROQ_API_KEY=...            (required, unless ANTHROPIC_API_KEY is set)
+#   ANTHROPIC_API_KEY=...       (optional — auto-upgrades the brain to Claude)
+#   JARVIS_ENCRYPTION_KEY=...   (recommended — stable key so encrypted data survives)
+#   VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_EMAIL  (recommended for push)
+#   PUBLIC_URL=https://<your-app>.up.railway.app        (required for Twilio webhooks)
+#   DATA_DIR is preset to /data by the Dockerfile — only override if you mount elsewhere.
+
+[build]
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/api/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

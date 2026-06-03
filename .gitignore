@@ -1,0 +1,28 @@
+node_modules/
+
+# Secrets & credentials — never commit
+.env
+.env.local
+.jarvis_key
+.jarvis_vapid.json
+.google_token.json
+
+# Local SQLite DB (+ WAL/SHM sidecars)
+jarvis_memory.db
+*.db-shm
+*.db-wal
+
+# Runtime / generated
+audio/
+logs/
+backups/
+*.mp3
+data/
+
+# Built frontend (produced by `cd client && npm run build`)
+public/assets/
+public/index.html
+public/vite.svg
+
+# OS / editor
+.DS_Store
