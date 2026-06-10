@@ -129,13 +129,22 @@ class MusicService {
     );
   }
 
+  // Derive the redirect URI from the request so it matches the deployed URL (and
+  // the callback the Integrations UI tells the user to register). Falls back to
+  // SPOTIFY_REDIRECT_URI / PUBLIC_URL, then localhost for dev.
+  _redirectUri(req) {
+    if (process.env.SPOTIFY_REDIRECT_URI) return process.env.SPOTIFY_REDIRECT_URI;
+    if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, '') + '/api/spotify/callback';
+    return `${req.protocol}://${req.get('host')}/api/spotify/callback`;
+  }
+
   setupRoutes(app) {
     // OAuth flow
     app.get('/api/spotify/auth', (req, res) => {
       if (!this.ready) return res.status(503).json({ error: 'Spotify not configured' });
       const scopes = 'user-read-currently-playing user-modify-playback-state user-read-playback-state';
       const authUrl = `https://accounts.spotify.com/authorize?` +
-        `client_id=${this.clientId}&response_type=code&redirect_uri=${encodeURIComponent(this.redirectUri)}` +
+        `client_id=${this.clientId}&response_type=code&redirect_uri=${encodeURIComponent(this._redirectUri(req))}` +
         `&scope=${encodeURIComponent(scopes)}`;
       res.redirect(authUrl);
     });
@@ -154,7 +163,7 @@ class MusicService {
           body: new URLSearchParams({
             grant_type: 'authorization_code',
             code,
-            redirect_uri: this.redirectUri,
+            redirect_uri: this._redirectUri(req),
           }),
         });
 

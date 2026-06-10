@@ -16,10 +16,14 @@ class EmbeddingService {
     if (this._loading) return this._loading;
 
     this._loading = (async () => {
-      console.log('🔄 Loading embedding model (first time may download ~50MB)...');
+      console.log('🔄 Loading embedding model...');
       if (!pipeline) {
-        const { pipeline: _pipeline } = await import('@xenova/transformers');
-        pipeline = _pipeline;
+        const transformers = await import('@xenova/transformers');
+        // Use a stable on-disk cache dir so the model can be pre-baked into the
+        // Docker image at build time and reused at runtime (no ~50MB cold-start
+        // download). Falls back to the library default for local dev.
+        if (process.env.TRANSFORMERS_CACHE) transformers.env.cacheDir = process.env.TRANSFORMERS_CACHE;
+        pipeline = transformers.pipeline;
       }
       this.extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
       this.ready = true;

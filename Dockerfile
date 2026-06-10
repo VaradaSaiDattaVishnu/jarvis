@@ -25,6 +25,12 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# Pre-bake the embedding model into the image so document indexing (RAG / Feature
+# 2) never blocks on a ~50MB cold-start download at runtime. The same TRANSFORMERS_CACHE
+# path is used at runtime (server/embeddings.js), so the cached model is reused.
+ENV TRANSFORMERS_CACHE=/app/.cache/transformers
+RUN node -e "(async()=>{const t=await import('@xenova/transformers');t.env.cacheDir=process.env.TRANSFORMERS_CACHE;await t.pipeline('feature-extraction','Xenova/all-MiniLM-L6-v2');console.log('✅ embedding model baked into image');})().catch(e=>{console.error(e);process.exit(1)})"
+
 # Copy server code
 COPY server/ ./server/
 

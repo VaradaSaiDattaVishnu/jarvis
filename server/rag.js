@@ -106,37 +106,51 @@ class RAGService {
     return { id: docId, title, chunks: chunks.length, chars: body.length };
   }
 
-  // ─── Vector search across all chunks ────────────────────
+  // ─── Hybrid search across all chunks ────────────────────
+  // Semantic (cosine) results are merged with keyword (LIKE) matches so an exact
+  // phrase that scores below the cosine threshold still surfaces — pure semantic
+  // alone silently missed terms that are literally in the document.
   async search(query, topK = 5) {
     if (!query || !query.trim()) return [];
 
+    const results = [];
+    const seen = new Set();
+    const key = r => `${r.docId}:${(r.content || '').slice(0, 40)}`;
+
+    // 1) Semantic
     if (this.embeddings.ready) {
       try {
         const q = await this.embeddings.embed(query);
         const rows = this.db.prepare(
-          `SELECT c.id, c.content, c.embedding, c.doc_id, d.title
+          `SELECT c.content, c.embedding, c.doc_id, d.title
            FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
            WHERE c.embedding IS NOT NULL`
         ).all();
-        if (rows.length > 0) {
-          const scored = rows.map(r => {
-            const emb = EmbeddingService.fromBuffer(r.embedding);
-            return { docId: r.doc_id, title: r.title, content: r.content, similarity: this.embeddings.cosineSimilarity(q, emb) };
-          }).filter(r => r.similarity >= 0.25).sort((a, b) => b.similarity - a.similarity);
-          return scored.slice(0, topK);
-        }
+        const scored = rows.map(r => ({
+          docId: r.doc_id, title: r.title, content: r.content,
+          similarity: this.embeddings.cosineSimilarity(q, EmbeddingService.fromBuffer(r.embedding)),
+        })).filter(r => r.similarity >= 0.2).sort((a, b) => b.similarity - a.similarity);
+        for (const r of scored.slice(0, topK)) { results.push(r); seen.add(key(r)); }
       } catch (e) {
-        console.error('RAG semantic search failed, using keyword fallback:', e.message);
+        console.error('RAG semantic search failed, using keyword only:', e.message);
       }
     }
 
-    // Keyword fallback
-    const like = `%${query.replace(/[%_]/g, '')}%`;
-    return this.db.prepare(
-      `SELECT c.content, d.title, c.doc_id as docId
-       FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
-       WHERE c.content LIKE ? LIMIT ?`
-    ).all(like, topK).map(r => ({ ...r, similarity: null }));
+    // 2) Keyword — always run, to catch exact matches semantic ranked below threshold.
+    if (results.length < topK) {
+      const like = `%${query.replace(/[%_]/g, '')}%`;
+      const kw = this.db.prepare(
+        `SELECT c.content, d.title, c.doc_id as docId
+         FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
+         WHERE c.content LIKE ? LIMIT ?`
+      ).all(like, topK);
+      for (const r of kw) {
+        if (results.length >= topK) break;
+        if (!seen.has(key(r))) { results.push({ ...r, similarity: null }); seen.add(key(r)); }
+      }
+    }
+
+    return results.slice(0, topK);
   }
 
   // Format retrieved chunks as grounded context for the LLM (with citations)

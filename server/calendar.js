@@ -50,6 +50,17 @@ class CalendarService {
     }
   }
 
+  // Derive the OAuth redirect URI that matches the URL the user actually reached
+  // the app on. In production GOOGLE_REDIRECT_URI is usually unset, so falling back
+  // to localhost broke the flow (redirect_uri_mismatch). Deriving from the request
+  // (with trust proxy on) yields the real public callback — the same one the
+  // Integrations UI tells the user to register — and still works in local dev.
+  _redirectUri(req) {
+    if (process.env.GOOGLE_REDIRECT_URI) return process.env.GOOGLE_REDIRECT_URI;
+    if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, '') + '/api/google/callback';
+    return `${req.protocol}://${req.get('host')}/api/google/callback`;
+  }
+
   // ─── OAuth Routes ──────────────────────────────────────
   setupRoutes(app) {
     // Start OAuth flow
@@ -61,6 +72,7 @@ class CalendarService {
         access_type: 'offline',
         scope: SCOPES,
         prompt: 'consent',
+        redirect_uri: this._redirectUri(req),
       });
       res.redirect(url);
     });
@@ -71,7 +83,8 @@ class CalendarService {
       if (!code) return res.status(400).send('No code provided');
 
       try {
-        const { tokens } = await this.oauth2Client.getToken(code);
+        // redirect_uri MUST match the one used to start the flow.
+        const { tokens } = await this.oauth2Client.getToken({ code, redirect_uri: this._redirectUri(req) });
         this.oauth2Client.setCredentials(tokens);
         fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
         this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
