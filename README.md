@@ -1,5 +1,7 @@
 # 🤖 J.A.R.V.I.S — Your Personal AI Voice Assistant
 
+### 🔴 Live: **https://jarvis-production-1742.up.railway.app**
+
 A real-time, voice-first AI assistant with persistent memory and an **agentic brain**.
 Talk naturally, get instant spoken replies, and let JARVIS actually *do* things —
 set reminders, manage tasks, search the web, read your documents, check your
