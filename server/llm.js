@@ -205,27 +205,15 @@ class LLMService {
     for (let iter = 0; iter < MAX_ITERS; iter++) {
       if (signal?.aborted) return;
 
-      // ── Get the assistant turn ────────────────────────────
-      // Claude: stream so prose reaches TTS as it's generated.
-      // Groq:   invoke (non-streaming) — Groq's streamed tool-call mode is
-      //         unreliable (it 400s mid-stream), and Groq is fast enough that a
-      //         per-turn non-streamed call is imperceptible and rock-solid.
-      let assistant; // AIMessage with .content and .tool_calls
-      if (this.provider === 'claude') {
-        let gathered;
-        const stream = await mainWithTools.stream(convo, signal ? { signal } : undefined);
-        for await (const chunk of stream) {
-          if (signal?.aborted) return;
-          const t = textOf(chunk.content);
-          if (t) yield { type: 'text', text: t };
-          gathered = gathered === undefined ? chunk : gathered.concat(chunk);
-        }
-        assistant = gathered;
-      } else {
-        assistant = await this._groqAgentStep(mainWithTools, fastWithTools, convo, signal, iter);
-        const t = textOf(assistant.content);
-        if (t) yield { type: 'text', text: t };
-      }
+      // ── Get the assistant turn (STREAMED for both providers) ───────────
+      // Streaming is what makes voice feel instant: the user hears JARVIS start
+      // talking as the first words generate, instead of waiting for the whole
+      // reply. Groq streaming-with-tools works fine via LangChain (verified), so
+      // we no longer fall back to a slow non-streamed invoke. _streamTurn yields
+      // clean prose, guards against a Llama `<function=…>` text-tool-call leaking
+      // into speech, and returns the final AIMessage (with tool_calls).
+      const assistant = yield* this._streamTurn(mainWithTools, fastWithTools, convo, signal, iter);
+      if (signal?.aborted || assistant === null) return;
 
       const toolCalls = (assistant && assistant.tool_calls) || [];
       if (toolCalls.length === 0) {
@@ -267,34 +255,81 @@ class LLMService {
     yield { type: 'text', text: textOf(finalResp.content) || 'Sorry, I ran out of steps on that — could you try rephrasing?' };
   }
 
-  // One Groq agent step: invoke with tools, with a 429→fast fallback and the
-  // Llama text-format tool-call recovery shim (the one piece LangChain can't do
-  // for us). Always returns an AIMessage that carries .tool_calls when present.
-  async _groqAgentStep(mainWithTools, fastWithTools, convo, signal, iter) {
+  // Stream one assistant turn for either provider. Yields {type:'text'} for clean
+  // prose as it arrives and RETURNS the final AIMessage (with tool_calls). On
+  // Groq it also: (a) suppresses a `<function=…>` text-format tool call so it's
+  // never spoken, recovering the real call after the stream; and (b) falls back
+  // to a non-streamed invoke + recovery if Groq rejects a streamed tool call
+  // (rare) — and retries on the fast model under a rate limit.
+  async *_streamTurn(mainWithTools, fastWithTools, convo, signal, iter) {
     const opts = signal ? { signal } : undefined;
-    let resp;
     try {
-      resp = await mainWithTools.invoke(convo, opts);
+      return yield* this._consume(await mainWithTools.stream(convo, opts), signal, iter);
     } catch (error) {
-      if (isToolUseFailed(error)) return this._recoverFromError(error, iter);
+      if (signal?.aborted) return null;
+      if (this.provider === 'groq' && isToolUseFailed(error)) return this._recoverFromError(error, iter);
       if (isRateLimited(error)) {
         try {
-          resp = await fastWithTools.invoke(convo, opts);
+          return yield* this._consume(await fastWithTools.stream(convo, opts), signal, iter);
         } catch (e2) {
-          if (isToolUseFailed(e2)) return this._recoverFromError(e2, iter);
+          if (this.provider === 'groq' && isToolUseFailed(e2)) return this._recoverFromError(e2, iter);
           throw e2;
         }
+      }
+      throw error;
+    }
+  }
+
+  // Drain a streamed response: yield clean prose, accumulate the message, and
+  // hold back / suppress any `<function=…>` text-format tool call (Groq/Llama
+  // edge case) so it isn't spoken — recovering the real call from the gathered
+  // content if the native tool_calls channel came back empty. Returns the
+  // AIMessage (or null if aborted).
+  async *_consume(stream, signal, iter) {
+    let gathered;
+    let pending = '';
+    let suppressing = false;
+    for await (const chunk of stream) {
+      if (signal?.aborted) return null;
+      gathered = gathered === undefined ? chunk : gathered.concat(chunk);
+      if (suppressing) continue;
+      const t = textOf(chunk.content);
+      if (!t) continue;
+      pending += t;
+      const lt = pending.lastIndexOf('<');
+      if (lt === -1) {
+        yield { type: 'text', text: pending };
+        pending = '';
+        continue;
+      }
+      const tail = pending.slice(lt);
+      if (tail.startsWith('<function')) {
+        const safe = pending.slice(0, lt);
+        if (safe) yield { type: 'text', text: safe };
+        pending = '';
+        suppressing = true; // rest of this turn is a tool call, not speech
+      } else if ('<function'.startsWith(tail)) {
+        // '<' could be the start of a (split) tool tag — flush before it, hold the rest
+        const safe = pending.slice(0, lt);
+        if (safe) yield { type: 'text', text: safe };
+        pending = tail;
       } else {
-        throw error;
+        // a '<' that isn't a tool tag (e.g. "<3") — safe to emit
+        yield { type: 'text', text: pending };
+        pending = '';
       }
     }
-    // Native channel was empty but the model emitted text-format calls inline.
-    if ((!resp.tool_calls || resp.tool_calls.length === 0)
-      && typeof resp.content === 'string' && resp.content.includes('<function=')) {
-      const recovered = this._recoverFromText(resp.content, iter);
+    if (signal?.aborted) return null;
+    if (!suppressing && pending) yield { type: 'text', text: pending };
+
+    // Native tool_calls empty but the model emitted a text-format call → recover.
+    if (this.provider === 'groq'
+      && !(gathered && gathered.tool_calls && gathered.tool_calls.length)
+      && typeof gathered?.content === 'string' && gathered.content.includes('<function=')) {
+      const recovered = this._recoverFromText(gathered.content, iter);
       if (recovered) return recovered;
     }
-    return resp;
+    return gathered;
   }
 
   _recoverFromError(error, iter) {

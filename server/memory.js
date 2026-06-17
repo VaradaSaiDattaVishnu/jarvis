@@ -1052,6 +1052,9 @@ If no notable entities, return [].`,
   // slow" regression), and on Claude cost ~8x per turn. moodService is passed in
   // so the mood lands in mood_log (read by getMoodContext on the next turn).
   async extractAndStore(llmService, userMsg, assistantMsg, sessionId, moodService = null) {
+    // Skip trivial exchanges (greetings/acks) — nothing to learn, and it spares
+    // the rate-limited free tier an extra call.
+    if (`${userMsg} ${assistantMsg}`.replace(/\s+/g, ' ').trim().length < 25) return;
     const profile = this.getProfile();
     const profileNote = Object.keys(profile).length
       ? `\n\nKnown profile (only return fields that change): ${JSON.stringify(profile)}`
@@ -1060,7 +1063,11 @@ If no notable entities, return [].`,
 
     let data;
     try {
-      data = await llmService.extractStructured(EXTRACTION_SYSTEM + profileNote, exchange, EXTRACTION_SCHEMA, { useMainModel: true });
+      // Run extraction on the FAST model. On Groq the 8b model draws from a
+      // SEPARATE tokens-per-minute pool than the 70b agent, so this background
+      // call no longer competes with the user-facing reply for rate limit — the
+      // main cause of turns 429-ing (→ no audio + slow). On Claude this is Haiku.
+      data = await llmService.extractStructured(EXTRACTION_SYSTEM + profileNote, exchange, EXTRACTION_SCHEMA, { useMainModel: false });
     } catch (e) {
       console.error('❌ Consolidated extraction failed:', e.message);
       return;

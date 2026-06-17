@@ -802,7 +802,10 @@ wss.on('connection', (ws) => {
         // Real-time data (web/weather/calendar/email/news) now comes from tools,
         // so we no longer pre-fetch it with brittle regex intent detection.
         const relevantMemories = await memory.searchMemories(userText);
-        const recentMessages = memory.getRecentMessages(sessionId);
+        // Keep history short — each turn re-sends it, and a long tail bloats every
+        // agent call against Groq's free-tier tokens/minute. 8 messages is plenty
+        // of working context for a voice chat.
+        const recentMessages = memory.getRecentMessages(sessionId, 8);
         const profileText = memory.getFormattedProfile();
         const moodContext = mood.getMoodContext();
 
@@ -838,8 +841,10 @@ wss.on('connection', (ws) => {
         if (summariesText) phase4Context += '\n\n[RECENT CONVERSATION SUMMARIES]\n' + summariesText;
         if (followUpsText) phase4Context += '\n\n[FOLLOW-UP]\n' + followUpsText;
 
-        // System prompt assembly with size management.
-        const MAX_PROMPT_CHARS = 12000;
+        // System prompt assembly with size management. Trimmed from 12000 → 7500
+        // so each agent call stays well under Groq's free-tier tokens/minute
+        // (the personality prompt + tool schemas are already ~2.6k tokens fixed).
+        const MAX_PROMPT_CHARS = 7500;
         const basePrompt = personality.systemPrompt + `\n\nCurrent time: ${new Date().toLocaleString()}` + TOOLS_GUIDE;
 
         const sections = [memoryContext, moodContext, remindersContext, phase4Context];
