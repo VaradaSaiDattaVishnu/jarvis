@@ -3,6 +3,61 @@
 > Working doc for the "fix all bugs + add 3 AI features + deploy" effort.
 > **Status: feature-complete. Server + client built & verified. Ready to ship.**
 
+---
+
+## 2026-06-17 — LangChain.js rebuild + critical bug fixes
+
+After the previous rebuild, four regressions made the app feel broken. Root-caused
+and fixed, and the LLM + RAG layers were rebuilt on **LangChain.js** (0.3.x, Node-18
+compatible) for a cleaner, provider-portable core.
+
+**Root-caused & fixed**
+1. **Voice "half one accent, half garbled"** — `tts.js` `detectLanguage()` ran
+   per-clause and its Latin-script word lists matched everyday English ("do",
+   "as", "per", "la"), so clauses were spoken with a Portuguese/Italian neural
+   voice. Now detects **only non-Latin scripts, dominance-gated (≥30%)**; Latin
+   text always keeps the configured voice. Verified across en/hi/ja/zh + mixed.
+2. **RAG "you haven't uploaded any" / can't summarize / 10-min hang** — uploads
+   could store **NULL embeddings** (model not ready) → permanently invisible; and
+   top-k search can't summarize a whole file. Rebuilt RAG on LangChain
+   (`RecursiveCharacterTextSplitter` + a `MiniLMEmbeddings` adapter over the
+   cached @xenova model + `MemoryVectorStore` hydrated from SQLite). Always embeds;
+   backfills legacy NULLs on boot. Added **`list_documents` + `read_document`**
+   tools so "summarize my doc" works. Verified: index → semantic Q&A → grounded
+   whole-doc summary.
+3. **Latency ("razor fast → slow")** — every turn fired **8 background LLM calls**
+   (memories/profile/mood/relationships/tasks/preferences/entities/follow-ups),
+   tripping Groq's 12k-TPM free tier (429 → next turn slow) and ~8×-ing Claude
+   cost. Collapsed into **ONE** `withStructuredOutput` call
+   (`memory.extractAndStore`, Zod schema), fanned into the existing setters.
+   Verified: one ~1.5s call captured name/job/interests/task/mood/entities/follow-up.
+4. **STT "can't understand my inputs"** — `ChatInput.tsx` mic dropped results
+   while speaking and churned stop/start. Rebuilt the speaking↔listening state
+   machine (single `runningRef` guard, clean resume, no double-`start()`).
+
+**LangChain migration (Hybrid)**
+- `llm.js` → `ChatAnthropic` + `ChatGroq`; unified `.bindTools()` + `.stream()`
+  agent loop (Claude streams; Groq invokes — its streamed tool calls 400);
+  `.withStructuredOutput()` for extraction. **Kept custom (justified in code):**
+  the WS streaming orchestration, edge-TTS, SQLite memory, and the Groq/Llama
+  text-format tool-call **recovery shim** (no framework replicates it). Added an
+  **empty-turn safety net** (nudge-and-retry, then forced reply) so Llama's
+  occasional no-op turns never leave the user with silence.
+- Model IDs unchanged: `claude-sonnet-4-6` / `claude-haiku-4-5-20251001`.
+- Deps added: `@langchain/core@^0.3`, `@langchain/anthropic@^0.3`,
+  `@langchain/groq@^0.2`, `@langchain/textsplitters@^0.1`, `langchain@^0.3`, `zod`.
+- Superseded (now dead, safe to delete later): the per-field extractors
+  `extractMemoriesFromExchange/updateUserModel/extractRelationships/extractTasks/extractPreferences/extractEntities`,
+  `mood.analyzeMood`, `followUp.detectFollowUpOpportunity`.
+
+**Verified live (PORT=3999, Groq, throwaway DB):** boot clean; client `tsc -b`
++ vite build clean; chat + `get_current_time` tool (TTFB ~1s, audio OK); RAG
+summarize after prior history (grounded, non-empty); single consolidated
+extraction in logs. (Only "failure": Groq free-tier 429 from rapid test volume —
+now surfaced as a friendly rate-limit message.)
+
+---
+
 ## Decisions (locked)
 - **Three AI features built:** (1) agentic tool-calling loop, (2) voice RAG over uploaded documents, (3) proactive AI agent.
 - **Deploy:** new GitHub repo under `VaradaSaiDattaVishnu` (gh authed, full repo scope) + Railway-ready (Dockerfile + railway.toml).

@@ -166,9 +166,41 @@ function buildTools(services) {
     if (!results.length) {
       const stats = rag.getStats();
       if (stats.documents === 0) return 'The user has not uploaded any documents yet. Suggest they add documents in the Documents tab.';
-      return 'No relevant passages found in the uploaded documents.';
+      return 'No matching passages found. If the user wants an overview or summary of a whole document, call read_document instead.';
     }
     return rag.formatForContext(results);
+  });
+
+  add({
+    name: 'list_documents',
+    description: "List the titles and ids of the user's uploaded documents (their knowledge base). Use this to see what's available, or before summarizing/reading one so you know its id or exact title.",
+    input_schema: { type: 'object', properties: {} },
+  }, async () => {
+    const docs = rag.listDocuments();
+    if (!docs.length) return 'The user has not uploaded any documents yet. Suggest they add one in the Documents tab.';
+    return 'Uploaded documents:\n' + docs.map(d => `- #${d.id} "${d.title}" (${d.chunk_count} chunks, ${(d.char_count / 1000).toFixed(1)}k chars)`).join('\n');
+  });
+
+  add({
+    name: 'read_document',
+    description: "Read the FULL text of one uploaded document, by id or title. Use this whenever the user asks you to summarize, review, or describe a WHOLE document — search_documents only returns short matching snippets and cannot summarize a full file. If you don't know which document they mean, call list_documents first.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Document id (preferred; from list_documents)' },
+        title: { type: 'string', description: 'Document title or part of it, if the id is unknown' },
+      },
+    },
+  }, async ({ id, title }) => {
+    const doc = rag.getDocument(id != null ? id : (title || ''));
+    if (!doc) {
+      const docs = rag.listDocuments();
+      if (!docs.length) return 'The user has not uploaded any documents yet.';
+      return `Couldn't find that document. Available: ${docs.map(d => `#${d.id} "${d.title}"`).join(', ')}.`;
+    }
+    const MAX = 12000; // keep within the prompt budget; summarize the head of very long docs
+    const body = doc.content.length > MAX ? doc.content.slice(0, MAX) + '\n…[truncated]' : doc.content;
+    return `Document "${doc.title}" (#${doc.id}):\n\n${body}`;
   });
 
   add({

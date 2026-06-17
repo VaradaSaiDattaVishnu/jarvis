@@ -20,27 +20,42 @@ const LANGUAGE_VOICES = {
   ta: 'ta-IN-ValluvarNeural',
 };
 
-// Simple language detection by Unicode range and common words
+// ─── Language detection (non-Latin scripts ONLY, dominance-gated) ───────
+// We detect language *only* from unambiguous non-Latin Unicode scripts, and
+// only when such a script clearly dominates the text.
+//
+// We deliberately do NOT guess Latin-script languages (es/fr/de/it/pt) from
+// common-word lists. That was the cause of the "half my reply is in a weird
+// accent" bug: words like "do", "as", "per", "la", "que" are everyday ENGLISH,
+// so an ordinary English clause matched the Portuguese/Italian/Spanish word
+// lists and got synthesized with a foreign neural voice — and because TTS runs
+// clause-by-clause, one clause spoke in en-US and the next in pt-BR. For Latin
+// script we now always keep the user's configured voice, which is correct for
+// English (and for whatever Latin-script voice they've chosen). Real Latin
+// multi-language detection needs a proper detector (e.g. `franc`), not regex.
+//
+// Dominance gate: a clause must have >=30% of its letters in a non-Latin script
+// before we switch, so a lone foreign name inside an English sentence does not
+// flip the whole clause to a foreign voice.
+const NON_LATIN_SCRIPTS = [
+  ['hi', /[ऀ-ॿ]/g], // Devanagari (Hindi)
+  ['te', /[ఀ-౿]/g], // Telugu
+  ['ta', /[஀-௿]/g], // Tamil
+  ['ja', /[぀-ゟ゠-ヿ]/g], // Japanese kana
+  ['ko', /[가-힯]/g], // Korean Hangul
+  ['zh', /[一-鿿]/g], // Chinese Han
+  ['ar', /[؀-ۿ]/g], // Arabic
+  ['ru', /[Ѐ-ӿ]/g], // Cyrillic (Russian)
+];
+
 function detectLanguage(text) {
-  // Check for non-Latin scripts first
-  if (/[\u0900-\u097F]/.test(text)) return 'hi'; // Devanagari (Hindi)
-  if (/[\u0C00-\u0C7F]/.test(text)) return 'te'; // Telugu
-  if (/[\u0B80-\u0BFF]/.test(text)) return 'ta'; // Tamil
-  if (/[\u3040-\u309F\u30A0-\u30FF]/.test(text)) return 'ja'; // Japanese
-  if (/[\uAC00-\uD7AF]/.test(text)) return 'ko'; // Korean
-  if (/[\u4E00-\u9FFF]/.test(text)) return 'zh'; // Chinese
-  if (/[\u0600-\u06FF]/.test(text)) return 'ar'; // Arabic
-  if (/[\u0400-\u04FF]/.test(text)) return 'ru'; // Cyrillic (Russian)
-
-  // Latin-script languages: check for common words
-  const lower = text.toLowerCase();
-  if (/\b(el|la|los|las|es|está|pero|que|como|por)\b/.test(lower)) return 'es';
-  if (/\b(le|la|les|est|sont|mais|avec|pour|dans)\b/.test(lower)) return 'fr';
-  if (/\b(der|die|das|ist|und|aber|mit|für|ein)\b/.test(lower)) return 'de';
-  if (/\b(il|la|che|sono|con|per|una|del)\b/.test(lower)) return 'it';
-  if (/\b(o|os|as|é|são|com|para|uma|do)\b/.test(lower)) return 'pt';
-
-  return 'en';
+  const letters = (text.match(/\p{L}/gu) || []).length;
+  if (letters === 0) return 'en';
+  for (const [lang, re] of NON_LATIN_SCRIPTS) {
+    const count = (text.match(re) || []).length;
+    if (count / letters >= 0.3) return lang;
+  }
+  return 'en'; // Latin / mostly-Latin → use the configured voice
 }
 
 // ─── Emotion → TTS parameter mapping ───────────────────

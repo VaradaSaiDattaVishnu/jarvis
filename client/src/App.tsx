@@ -249,7 +249,13 @@ export default function App() {
 
         case 'error':
           console.error('WS error:', msg.message);
+          // Reset streaming state so the input unlocks (it's disabled while
+          // isStreaming) and surface the message — otherwise an error (e.g. a
+          // rate limit) leaves the UI stuck "thinking" with nothing shown.
+          stopAudio();
+          completeResponse();
           setCoreState('idle');
+          showToast(msg.message || 'Something went wrong. Try again.', 'error');
           break;
 
         case 'voice_changed':

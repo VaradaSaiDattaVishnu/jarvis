@@ -1,16 +1,36 @@
-// Unified LLM service — supports Claude (preferred) and Groq (free fallback)
-// Auto-detects based on which API key is available in .env.
+// Unified LLM service — built on LangChain.js (ChatAnthropic + ChatGroq).
 //
-// Capabilities:
-//   chatStream(system, messages, signal)            → plain streaming text
-//   chat(system, messages, opts)                    → non-streaming (background tasks)
-//   agentStream(system, messages, tools, exec, sig) → multi-turn function-calling loop
+// Auto-detects the provider from which API key is present: a real
+// ANTHROPIC_API_KEY → Claude (claude-sonnet-4-6), otherwise GROQ_API_KEY → Groq
+// (llama-3.3-70b-versatile). Both are LangChain chat models, so tool binding,
+// streaming, and structured output go through ONE normalized interface.
 //
-// agentStream yields a stream of typed events so the orchestrator can both speak
-// the assistant's text AND surface tool activity to the UI:
+// Why LangChain here: the chat-model abstraction (`bindTools`, `.stream()`,
+// `.withStructuredOutput()`) gives us provider-portable tool calling and typed
+// structured extraction for free — the parts that were the most hand-rolled and
+// brittle before. We keep ONE thing custom on purpose (see _groqAgentStep): the
+// recovery shim for Llama's text-format tool calls, because Groq/Llama still
+// occasionally emit `<function=name{json}</function>` as plain text instead of
+// the native tool-call channel, and no framework normalizes that away.
+//
+// Public surface (kept stable so server/index.js and the other services that
+// call us don't change):
+//   chatStream(system, messages, signal)              → async generator of text
+//   chat(system, messages, { useMainModel })          → Promise<string>
+//   agentStream(system, messages, tools, exec, signal)→ async generator of events
+//   extractStructured(system, text, zodSchema, opts)  → Promise<object>  (NEW)
+//
+// agentStream yields typed events so the orchestrator can speak the prose AND
+// surface tool activity to the UI:
 //   { type: 'text', text }                  — a chunk of assistant prose (speak it)
 //   { type: 'tool_start', name, input }     — model decided to call a tool
 //   { type: 'tool_result', name, result }   — tool finished (result is a string)
+
+const { ChatAnthropic } = require('@langchain/anthropic');
+const { ChatGroq } = require('@langchain/groq');
+const {
+  SystemMessage, HumanMessage, AIMessage, ToolMessage,
+} = require('@langchain/core/messages');
 
 const PLACEHOLDER = /^(your[-_]|sk-ant-xxx|xxx|changeme|placeholder)/i;
 
@@ -18,14 +38,17 @@ function isRealKey(k) {
   return typeof k === 'string' && k.trim().length > 10 && !PLACEHOLDER.test(k.trim()) && !k.includes('-here');
 }
 
+// ─── Llama text-format tool-call recovery (Groq only) ───────────────────
 // Groq/Llama sometimes emit tool calls as TEXT in the functionary format
 // (`<function=name{json}</function>`) instead of the native tool_calls channel.
-// Groq's server then rejects the generation with code `tool_use_failed`, handing
-// back the raw text in `failed_generation`. These helpers recover the intended
-// call so the agent loop keeps working instead of hard-failing.
+// Groq's server may then reject the generation with code `tool_use_failed`,
+// handing back the raw text in `failed_generation`; other times the text just
+// comes through as the message content. These helpers recover the intended call
+// so the agent loop keeps working instead of hard-failing the turn.
 function extractFailedGeneration(error) {
   return error?.error?.failed_generation
     || error?.error?.error?.failed_generation
+    || error?.lc_error_code?.failed_generation
     || (() => {
       const msg = error?.message || '';
       const idx = msg.indexOf('{');
@@ -36,12 +59,15 @@ function extractFailedGeneration(error) {
 
 function isToolUseFailed(error) {
   const code = error?.error?.code || error?.error?.error?.code;
-  return code === 'tool_use_failed' || /failed to call a function/i.test(error?.message || '');
+  return code === 'tool_use_failed' || /failed to call a function|tool_use_failed/i.test(error?.message || '');
 }
 
-// Extract a brace-balanced JSON object starting at the '{' at startIdx, so we
-// don't over-capture trailing prose and we stop at the matching close brace
-// (handles nested braces and quoted strings). Returns the substring or null.
+function isRateLimited(error) {
+  return error?.status === 429 || error?.error?.status === 429 || /\b429\b|rate.?limit/i.test(error?.message || '');
+}
+
+// Extract a brace-balanced JSON object starting at the '{' at startIdx (handles
+// nested braces and quoted strings). Returns the substring or null.
 function extractBalancedJson(text, startIdx) {
   let depth = 0, inStr = false, quote = '', esc = false;
   for (let i = startIdx; i < text.length; i++) {
@@ -57,9 +83,8 @@ function extractBalancedJson(text, startIdx) {
   return null;
 }
 
-// Best-effort: coerce a JS/Python-ish object literal into a strict-JSON string.
-// Llama's functionary format often emits single quotes and True/False/None.
-// Returns a parseable JSON string, or null if it still can't be salvaged.
+// Coerce a JS/Python-ish object literal into strict JSON (Llama emits single
+// quotes and True/False/None). Returns a parseable JSON string, or null.
 function coerceToJsonString(raw) {
   if (!raw) return null;
   try { JSON.parse(raw); return raw; } catch { /* attempt repair */ }
@@ -72,8 +97,6 @@ function coerceToJsonString(raw) {
 function parseLlamaToolCalls(text) {
   const calls = [];
   if (!text) return calls;
-  // Find each <function=name ...{ and balance-match the JSON object — robust to
-  // missing </function> tags, multiple calls, nested braces and trailing prose.
   const re = /<function=([a-zA-Z0-9_]+)>?\s*\{/g;
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -81,106 +104,87 @@ function parseLlamaToolCalls(text) {
     const json = extractBalancedJson(text, braceStart);
     if (json) {
       calls.push({ name: m[1], args: json });
-      re.lastIndex = braceStart + json.length; // resume scanning after this call
+      re.lastIndex = braceStart + json.length;
     }
   }
   return calls;
 }
 
-// Build a synthetic Groq response carrying recovered tool calls (or recovered
-// prose) from a tool_use_failed error. Shared by the primary + 429-fallback paths.
-function recoverFromToolFailure(error, iter) {
-  const fg = extractFailedGeneration(error);
-  const usable = parseLlamaToolCalls(fg)
-    .map(c => ({ name: c.name, args: coerceToJsonString(c.args) }))
-    .filter(c => c.args !== null);
-  if (usable.length) {
-    return { choices: [{ message: {
-      content: null,
-      tool_calls: usable.map((c, i) => ({ id: `gtc_${iter}_${i}`, type: 'function', function: { name: c.name, arguments: c.args } })),
-    } }] };
+// ─── Small helpers ───────────────────────────────────────
+// Pull plain text out of a LangChain message/chunk `content`, which can be a
+// string (Groq, Claude text) or an array of content blocks (Claude tool turns).
+function textOf(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(b => (typeof b === 'string' ? b : (b?.type === 'text' ? b.text : ''))).join('');
   }
-  const clean = String(fg || '').replace(/<\/?function[^>]*>/g, '').trim();
-  return { choices: [{ message: { content: clean || 'Sorry, I had trouble with that — could you rephrase?' } }] };
+  return '';
+}
+
+// Convert our { role, content } history into LangChain message objects.
+function toLcMessages(system, messages) {
+  const out = [];
+  if (system) out.push(new SystemMessage(system));
+  for (const m of messages || []) {
+    const content = typeof m.content === 'string' ? m.content : textOf(m.content);
+    if (m.role === 'assistant') out.push(new AIMessage(content));
+    else out.push(new HumanMessage(content)); // treat anything else as user input
+  }
+  return out;
 }
 
 class LLMService {
   constructor({ anthropicKey, groqKey }) {
     if (isRealKey(anthropicKey)) {
       this.provider = 'claude';
-      const Anthropic = require('@anthropic-ai/sdk');
-      this.client = new Anthropic({ apiKey: anthropicKey.trim() });
       this.model = 'claude-sonnet-4-6';
       this.fastModel = 'claude-haiku-4-5-20251001';
+      const key = anthropicKey.trim();
+      this._make = (modelId, maxTokens) => new ChatAnthropic({ apiKey: key, model: modelId, maxTokens, maxRetries: 2 });
     } else if (isRealKey(groqKey)) {
       this.provider = 'groq';
-      const Groq = require('groq-sdk');
-      this.client = new Groq({ apiKey: groqKey.trim() });
       this.model = 'llama-3.3-70b-versatile';
       this.fastModel = 'llama-3.1-8b-instant';
+      const key = groqKey.trim();
+      this._make = (modelId, maxTokens) => new ChatGroq({ apiKey: key, model: modelId, maxTokens, temperature: 0.7, maxRetries: 2 });
     } else {
       throw new Error('No API key found. Set ANTHROPIC_API_KEY or GROQ_API_KEY in .env');
     }
-    console.log(`🧠 LLM Provider: ${this.provider} (${this.model})`);
+    this.main = this._make(this.model, 2048);
+    this.fast = this._make(this.fastModel, 1024);
+    console.log(`🧠 LLM Provider: ${this.provider} (${this.model}) via LangChain`);
   }
 
   get displayName() {
     return this.provider === 'claude' ? 'Claude' : 'Groq';
   }
 
-  // ─── Plain streaming chat ───────────────────────────────
+  // ─── Plain streaming chat (no tools) ────────────────────
   async *chatStream(system, messages, signal = null) {
-    if (this.provider === 'claude') {
-      yield* this._claudeStream(system, messages, signal);
-    } else {
-      yield* this._groqStream(system, messages, signal);
-    }
-  }
-
-  async *_claudeStream(system, messages, signal) {
-    const stream = await this.client.messages.create(
-      { model: this.model, max_tokens: 2048, system, messages, stream: true },
-      signal ? { signal } : undefined,
-    );
-    for await (const event of stream) {
-      if (signal?.aborted) break;
-      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-        yield event.delta.text;
-      }
-    }
-  }
-
-  async *_groqStream(system, messages, signal) {
-    const groqMessages = [{ role: 'system', content: system }, ...messages];
-    const run = (model, maxTokens) => this.client.chat.completions.create(
-      { model, messages: groqMessages, stream: true, temperature: 0.8, max_tokens: maxTokens },
-      signal ? { signal } : undefined,
-    );
+    const convo = toLcMessages(system, messages);
     try {
-      const stream = await run(this.model, 2048);
-      for await (const chunk of stream) {
-        if (signal?.aborted) break;
-        const content = chunk.choices[0]?.delta?.content;
-        if (content) yield content;
-      }
+      yield* this._streamText(this.main, convo, signal);
     } catch (error) {
-      if (error.status === 429) {
-        console.log('⚡ Rate limited, falling back to fast model');
-        const stream = await run(this.fastModel, 1024);
-        for await (const chunk of stream) {
-          if (signal?.aborted) break;
-          const content = chunk.choices[0]?.delta?.content;
-          if (content) yield content;
-        }
+      if (isRateLimited(error)) {
+        yield* this._streamText(this.fast, convo, signal); // 8b/haiku fallback
       } else {
         throw error;
       }
     }
   }
 
+  async *_streamText(model, convo, signal) {
+    const stream = await model.stream(convo, signal ? { signal } : undefined);
+    for await (const chunk of stream) {
+      if (signal?.aborted) break;
+      const t = textOf(chunk.content);
+      if (t) yield t;
+    }
+  }
+
   // ─── Agentic tool-calling loop ──────────────────────────
-  // tools: [{ name, description, input_schema (JSON Schema) }]
-  // execute: async (name, input) => string  (tool result to feed back to the model)
+  // tools:   [{ name, description, input_schema (JSON Schema) }]  (from tools.js)
+  // execute: async (name, input) => string                       (the dispatcher)
   async *agentStream(system, messages, tools, execute, signal = null) {
     if (!tools || tools.length === 0) {
       for await (const text of this.chatStream(system, messages, signal)) {
@@ -188,196 +192,149 @@ class LLMService {
       }
       return;
     }
-    if (this.provider === 'claude') {
-      yield* this._claudeAgent(system, messages, tools, execute, signal);
-    } else {
-      yield* this._groqAgent(system, messages, tools, execute, signal);
-    }
-  }
 
-  async *_claudeAgent(system, messages, tools, execute, signal) {
-    const anthropicTools = tools.map(t => ({
-      name: t.name,
-      description: t.description,
-      input_schema: t.input_schema,
-    }));
-    const convo = messages.map(m => ({ role: m.role, content: m.content }));
+    // LangChain accepts JSON-schema tool defs as { name, description, schema },
+    // so the conditional tool registry in tools.js feeds straight in.
+    const lcTools = tools.map(t => ({ name: t.name, description: t.description, schema: t.input_schema }));
+    const mainWithTools = this.main.bindTools(lcTools);
+    const fastWithTools = this.fast.bindTools(lcTools);
+    const convo = toLcMessages(system, messages);
     const MAX_ITERS = 6;
+    let nudged = false; // we only nudge an empty no-op turn once
 
     for (let iter = 0; iter < MAX_ITERS; iter++) {
       if (signal?.aborted) return;
 
-      const stream = await this.client.messages.create(
-        { model: this.model, max_tokens: 2048, system, messages: convo, tools: anthropicTools, stream: true },
-        signal ? { signal } : undefined,
-      );
-
-      const assistantBlocks = [];
-      let curText = null;
-      let curTool = null;
-      const toolUses = [];
-
-      for await (const event of stream) {
-        if (signal?.aborted) return;
-        if (event.type === 'content_block_start') {
-          if (event.content_block.type === 'text') {
-            curText = { type: 'text', text: '' };
-          } else if (event.content_block.type === 'tool_use') {
-            curTool = { id: event.content_block.id, name: event.content_block.name, _input: '' };
-          }
-        } else if (event.type === 'content_block_delta') {
-          if (event.delta.type === 'text_delta') {
-            if (curText) curText.text += event.delta.text;
-            yield { type: 'text', text: event.delta.text };
-          } else if (event.delta.type === 'input_json_delta') {
-            if (curTool) curTool._input += event.delta.partial_json;
-          }
-        } else if (event.type === 'content_block_stop') {
-          if (curText) { assistantBlocks.push(curText); curText = null; }
-          if (curTool) {
-            let input = {};
-            try { input = curTool._input ? JSON.parse(curTool._input) : {}; } catch { /* leave {} */ }
-            assistantBlocks.push({ type: 'tool_use', id: curTool.id, name: curTool.name, input });
-            toolUses.push({ id: curTool.id, name: curTool.name, input });
-            curTool = null;
-          }
+      // ── Get the assistant turn ────────────────────────────
+      // Claude: stream so prose reaches TTS as it's generated.
+      // Groq:   invoke (non-streaming) — Groq's streamed tool-call mode is
+      //         unreliable (it 400s mid-stream), and Groq is fast enough that a
+      //         per-turn non-streamed call is imperceptible and rock-solid.
+      let assistant; // AIMessage with .content and .tool_calls
+      if (this.provider === 'claude') {
+        let gathered;
+        const stream = await mainWithTools.stream(convo, signal ? { signal } : undefined);
+        for await (const chunk of stream) {
+          if (signal?.aborted) return;
+          const t = textOf(chunk.content);
+          if (t) yield { type: 'text', text: t };
+          gathered = gathered === undefined ? chunk : gathered.concat(chunk);
         }
+        assistant = gathered;
+      } else {
+        assistant = await this._groqAgentStep(mainWithTools, fastWithTools, convo, signal, iter);
+        const t = textOf(assistant.content);
+        if (t) yield { type: 'text', text: t };
       }
 
-      if (toolUses.length === 0) return; // final text already streamed
+      const toolCalls = (assistant && assistant.tool_calls) || [];
+      if (toolCalls.length === 0) {
+        // Final answer (text already streamed for Claude / yielded for Groq).
+        if (textOf(assistant && assistant.content).trim()) return;
+        // Empty no-op turn — Groq/Llama occasionally returns neither text nor a
+        // tool call, especially mid-conversation. Nudge once to unstick it
+        // (tools stay available); if still empty, fall through to the forced
+        // reply below so the user is never met with silence.
+        if (!nudged && iter < MAX_ITERS - 1) {
+          nudged = true;
+          convo.push(new HumanMessage('(You did not reply. Please answer my previous message now — call a tool first if you need information to do so.)'));
+          continue;
+        }
+        break;
+      }
 
-      convo.push({ role: 'assistant', content: assistantBlocks });
-      const toolResults = [];
-      for (const tu of toolUses) {
+      // Re-add the assistant turn as text + tool_calls only (never the raw
+      // streamed content array — that would double-encode the tool_use blocks).
+      convo.push(new AIMessage({ content: textOf(assistant.content), tool_calls: toolCalls }));
+
+      for (const tc of toolCalls) {
         if (signal?.aborted) return;
-        yield { type: 'tool_start', name: tu.name, input: tu.input };
+        yield { type: 'tool_start', name: tc.name, input: tc.args };
         let result;
-        try { result = await execute(tu.name, tu.input); }
+        try { result = await execute(tc.name, tc.args); }
         catch (e) { result = `Error: ${e.message}`; }
         const text = typeof result === 'string' ? result : JSON.stringify(result ?? '');
-        yield { type: 'tool_result', name: tu.name, result: text };
-        toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: text || '(no output)' });
+        yield { type: 'tool_result', name: tc.name, result: text };
+        convo.push(new ToolMessage({ content: text || '(no output)', tool_call_id: tc.id, name: tc.name }));
       }
-      convo.push({ role: 'user', content: toolResults });
     }
 
     // Exhausted the tool budget without a closing answer — force one final
-    // tool-less reply so the user always hears a response (mirrors the Groq net).
+    // tool-less reply so the user always hears a response.
     if (signal?.aborted) return;
-    const finalResp = await this.client.messages.create(
-      { model: this.model, max_tokens: 1024, system, messages: convo },
-      signal ? { signal } : undefined,
-    );
-    const finalText = finalResp.content.filter(b => b.type === 'text').map(b => b.text).join('');
-    yield { type: 'text', text: finalText || 'Sorry, I ran out of steps on that — could you try rephrasing?' };
+    const finalModel = this.provider === 'claude' ? this.main : this.fast;
+    const finalResp = await finalModel.invoke(convo, signal ? { signal } : undefined);
+    yield { type: 'text', text: textOf(finalResp.content) || 'Sorry, I ran out of steps on that — could you try rephrasing?' };
   }
 
-  // NOTE: Groq's STREAMING tool-call mode is unreliable — it frequently 400s with
-  // "Failed to call a function" when Llama emits a tool call mid-stream. Groq is
-  // fast enough (~hundreds of tok/s) that running each agent turn non-streaming is
-  // imperceptible, and it's rock-solid. The streamed tool loop lives on the Claude
-  // path, where streamed tool calls work reliably.
-  async *_groqAgent(system, messages, tools, execute, signal) {
-    const openaiTools = tools.map(t => ({
-      type: 'function',
-      function: { name: t.name, description: t.description, parameters: t.input_schema },
-    }));
-    const convo = [{ role: 'system', content: system }, ...messages.map(m => ({ role: m.role, content: m.content }))];
-    const MAX_ITERS = 6;
-
-    const mkRequest = (model, maxTokens, useTools) => {
-      const body = { model, messages: convo, temperature: 0.7, max_tokens: maxTokens };
-      if (useTools) { body.tools = openaiTools; body.tool_choice = 'auto'; }
-      return this.client.chat.completions.create(body, signal ? { signal } : undefined);
-    };
-
-    const complete = async (useTools, maxTokens, iter = 0) => {
-      try {
-        return await mkRequest(this.model, maxTokens, useTools);
-      } catch (error) {
-        // Recover Llama's text-format tool calls that Groq's parser rejected.
-        if (useTools && isToolUseFailed(error)) return recoverFromToolFailure(error, iter);
-        if (error.status === 429) {
-          console.log('⚡ Rate limited, falling back to fast model');
-          // The 8b model is MORE prone to text-format tool calls, so recover
-          // tool_use_failed on the fallback too instead of hard-failing the turn.
-          try {
-            return await mkRequest(this.fastModel, Math.min(maxTokens, 1024), useTools);
-          } catch (e2) {
-            if (useTools && isToolUseFailed(e2)) return recoverFromToolFailure(e2, iter);
-            throw e2;
-          }
+  // One Groq agent step: invoke with tools, with a 429→fast fallback and the
+  // Llama text-format tool-call recovery shim (the one piece LangChain can't do
+  // for us). Always returns an AIMessage that carries .tool_calls when present.
+  async _groqAgentStep(mainWithTools, fastWithTools, convo, signal, iter) {
+    const opts = signal ? { signal } : undefined;
+    let resp;
+    try {
+      resp = await mainWithTools.invoke(convo, opts);
+    } catch (error) {
+      if (isToolUseFailed(error)) return this._recoverFromError(error, iter);
+      if (isRateLimited(error)) {
+        try {
+          resp = await fastWithTools.invoke(convo, opts);
+        } catch (e2) {
+          if (isToolUseFailed(e2)) return this._recoverFromError(e2, iter);
+          throw e2;
         }
+      } else {
         throw error;
       }
-    };
-
-    for (let iter = 0; iter < MAX_ITERS; iter++) {
-      if (signal?.aborted) return;
-
-      const resp = await complete(true, 2048, iter);
-      if (signal?.aborted) return;
-
-      const msg = resp.choices?.[0]?.message || {};
-      const toolCalls = msg.tool_calls || [];
-
-      // Emit any prose the model produced alongside its decision.
-      if (msg.content) yield { type: 'text', text: msg.content };
-
-      if (toolCalls.length === 0) return; // final answer delivered
-
-      convo.push({ role: 'assistant', content: msg.content || null, tool_calls: toolCalls });
-      for (const tc of toolCalls) {
-        if (signal?.aborted) return;
-        let input = {};
-        try { input = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; } catch { /* leave {} */ }
-        yield { type: 'tool_start', name: tc.function?.name, input };
-        let result;
-        try { result = await execute(tc.function?.name, input); }
-        catch (e) { result = `Error: ${e.message}`; }
-        const text = typeof result === 'string' ? result : JSON.stringify(result ?? '');
-        yield { type: 'tool_result', name: tc.function?.name, result: text };
-        convo.push({ role: 'tool', tool_call_id: tc.id, content: text || '(no output)' });
-      }
     }
-
-    // Safety net: ran the whole tool budget without a closing answer — force a
-    // tool-less reply so the user ALWAYS hears a response (yield unconditionally,
-    // with a deterministic fallback if the model returns empty content).
-    if (signal?.aborted) return;
-    const final = await complete(false, 1024);
-    const text = final.choices?.[0]?.message?.content;
-    yield { type: 'text', text: text || 'Sorry, I ran out of steps on that — could you try rephrasing?' };
+    // Native channel was empty but the model emitted text-format calls inline.
+    if ((!resp.tool_calls || resp.tool_calls.length === 0)
+      && typeof resp.content === 'string' && resp.content.includes('<function=')) {
+      const recovered = this._recoverFromText(resp.content, iter);
+      if (recovered) return recovered;
+    }
+    return resp;
   }
 
-  // ─── Non-streaming chat (memory extraction, background tasks) ───
-  // Set useMainModel=true for tasks needing strong instruction-following.
+  _recoverFromError(error, iter) {
+    return this._recoverFromText(extractFailedGeneration(error), iter)
+      || new AIMessage('Sorry, I had trouble with that — could you rephrase?');
+  }
+
+  // Turn Llama's `<function=…>` text into a proper AIMessage with tool_calls
+  // (args parsed to objects, as LangChain expects). Returns null if nothing
+  // usable was found.
+  _recoverFromText(text, iter) {
+    if (!text) return null;
+    const calls = parseLlamaToolCalls(text)
+      .map((c, i) => {
+        const json = coerceToJsonString(c.args);
+        if (!json) return null;
+        let args;
+        try { args = JSON.parse(json); } catch { return null; }
+        return { id: `gtc_${iter}_${i}`, name: c.name, args, type: 'tool_call' };
+      })
+      .filter(Boolean);
+    if (calls.length) return new AIMessage({ content: '', tool_calls: calls });
+    const clean = String(text).replace(/<\/?function[^>]*>/g, '').trim();
+    return clean ? new AIMessage(clean) : null;
+  }
+
+  // ─── Non-streaming chat (background tasks) ──────────────
   async chat(system, messages, { useMainModel = false } = {}) {
-    if (this.provider === 'claude') {
-      return this._claudeChat(system, messages, useMainModel);
-    } else {
-      return this._groqChat(system, messages, useMainModel);
-    }
+    const model = useMainModel ? this.main : this.fast;
+    const resp = await model.invoke(toLcMessages(system, messages));
+    return textOf(resp.content) || '';
   }
 
-  async _claudeChat(system, messages, useMainModel = false) {
-    const response = await this.client.messages.create({
-      model: useMainModel ? this.model : this.fastModel,
-      max_tokens: 1024,
-      system,
-      messages,
-    });
-    return response.content.filter(b => b.type === 'text').map(b => b.text).join('') || '';
-  }
-
-  async _groqChat(system, messages, useMainModel = false) {
-    const response = await this.client.chat.completions.create({
-      model: useMainModel ? this.model : this.fastModel,
-      messages: [{ role: 'system', content: system }, ...messages],
-      temperature: 0.3,
-      max_tokens: 1024,
-    });
-    return response.choices[0]?.message?.content || '';
+  // ─── Structured extraction (one typed call, replaces N parsing calls) ───
+  // Pass a Zod schema; LangChain constrains the model to it via tool calling and
+  // returns the parsed object. Used by the consolidated memory extractor.
+  async extractStructured(system, userText, zodSchema, { useMainModel = true } = {}) {
+    const model = useMainModel ? this.main : this.fast;
+    const structured = model.withStructuredOutput(zodSchema);
+    return structured.invoke([new SystemMessage(system), new HumanMessage(userText)]);
   }
 }
 

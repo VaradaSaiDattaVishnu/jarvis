@@ -9,7 +9,8 @@ export default function ChatInput() {
   const inputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const listeningRef = useRef(false);
+  const listeningRef = useRef(false);  // does the user WANT the mic on?
+  const runningRef = useRef(false);     // is recognition actively running right now?
 
   const isStreaming = useChatStore((s) => s.isStreaming);
   const isSpeaking = useChatStore((s) => s.isSpeaking);
@@ -41,9 +42,27 @@ export default function ChatInput() {
     }
   };
 
+  // Start the recognizer only when it isn't already running. The Web Speech API
+  // throws InvalidStateError on a double .start(), and races with onend if you
+  // stop/start too quickly — runningRef guards both.
+  const safeStart = () => {
+    const rec = recognitionRef.current;
+    if (!rec || runningRef.current) return;
+    try {
+      rec.start();
+      runningRef.current = true;
+    } catch {
+      /* already started — ignore */
+    }
+  };
+
   const startListening = () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
+    if (!SpeechRecognition) {
+      console.warn('SpeechRecognition not supported in this browser');
+      return;
+    }
+    if (recognitionRef.current) return;
 
     const recognition = new SpeechRecognition();
     recognition.continuous = true;
@@ -51,82 +70,98 @@ export default function ChatInput() {
     recognition.lang = 'en-US';
 
     recognition.onresult = (event: any) => {
-      // Don't pick up JARVIS's own voice while audio is playing
-      if (useChatStore.getState().isSpeaking) return;
-
-      let transcript = '';
+      // Separate finalized text from in-progress (interim) text.
+      let finalText = '';
+      let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        transcript += event.results[i][0].transcript;
+        const r = event.results[i];
+        if (r.isFinal) finalText += r[0].transcript;
+        else interim += r[0].transcript;
       }
 
-      const currentMode = useChatStore.getState().voiceMode;
+      const mode = useChatStore.getState().voiceMode;
 
-      if (currentMode === 'cold') {
-        if (transcript.toLowerCase().includes('jarvis')) {
+      // Cold (wake-word) mode: do nothing until we hear "JARVIS".
+      if (mode === 'cold') {
+        if (/\bjarvis\b/i.test(finalText + ' ' + interim)) {
           setVoiceMode('conversation');
           setCoreState('passive');
         }
         return;
       }
 
-      // Conversation mode — auto-send on silence
-      if (event.results[event.resultIndex].isFinal) {
-        const finalText = transcript.trim();
-        if (finalText) {
-          sendMessage(finalText);
-          ws.send({ type: 'message', text: finalText });
-        }
-      } else {
-        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      // Conversation mode: pulse the orb on interim speech, send on a final.
+      if (interim.trim()) {
         setCoreState('active');
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
         silenceTimerRef.current = setTimeout(() => setCoreState('passive'), 1500);
+      }
+      const finalized = finalText.trim();
+      // Guard against echoing JARVIS's own voice: if it's mid-utterance, drop it.
+      if (finalized && !useChatStore.getState().isSpeaking) {
+        sendMessage(finalized);
+        ws.send({ type: 'message', text: finalized });
       }
     };
 
     recognition.onerror = (e: any) => {
-      if (e.error !== 'no-speech') setListen(false);
+      // 'no-speech' / 'aborted' are routine in continuous mode — keep going and
+      // let onend restart us. Only a denied mic permission should stop listening.
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        setListen(false);
+      }
     };
 
     recognition.onend = () => {
-      // Auto-restart only if listening and JARVIS is not currently speaking
+      runningRef.current = false;
+      // Continuous recognition ends itself periodically; restart if the user
+      // still wants the mic on and JARVIS isn't speaking.
       if (listeningRef.current && !useChatStore.getState().isSpeaking) {
-        try { recognition.start(); } catch { /* ignore duplicate start */ }
+        safeStart();
       }
     };
 
     recognitionRef.current = recognition;
-    recognition.start();
     setListen(true);
     setCoreState(voiceMode === 'cold' ? 'idle' : 'passive');
+    safeStart();
   };
 
   const stopListening = () => {
-    recognitionRef.current?.stop();
-    recognitionRef.current = null;
     setListen(false);
     setVoiceMode('cold');
     setCoreState('idle');
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    const rec = recognitionRef.current;
+    recognitionRef.current = null;
+    runningRef.current = false;
+    if (rec) { try { rec.stop(); } catch { /* ok */ } }
   };
 
-  // ─── Pause mic while JARVIS speaks, resume after ─────────
+  // ─── Pause mic while JARVIS speaks, resume cleanly after ─────────────────
+  // We suspend recognition during TTS playback so the mic never transcribes
+  // JARVIS's own voice, then resume shortly after it finishes (a small delay
+  // avoids catching the audio tail). This is the single place that drives the
+  // speaking↔listening handoff — onresult no longer has to fight it.
   useEffect(() => {
     if (!listeningRef.current || !recognitionRef.current) return;
-
     if (isSpeaking) {
-      // Suspend recognition so we don't hear JARVIS's own TTS output
       try { recognitionRef.current.stop(); } catch { /* ok */ }
-    } else {
-      // Audio finished — restart mic if in conversation mode
-      if (useChatStore.getState().voiceMode === 'conversation') {
-        try { recognitionRef.current.start(); } catch { /* already running */ }
-      }
+      return;
     }
+    const t = setTimeout(() => {
+      if (listeningRef.current && useChatStore.getState().voiceMode !== 'cold') safeStart();
+      else if (listeningRef.current) safeStart(); // cold mode still listens for the wake word
+    }, 250);
+    return () => clearTimeout(t);
   }, [isSpeaking]);
 
   useEffect(() => {
     return () => {
-      recognitionRef.current?.stop();
+      const rec = recognitionRef.current;
+      recognitionRef.current = null;
+      runningRef.current = false;
+      if (rec) { try { rec.stop(); } catch { /* ok */ } }
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     };
   }, []);
@@ -177,12 +212,12 @@ export default function ChatInput() {
 
       <div className="text-center mt-1.5 font-mono text-[0.5rem] text-jarvis-fg-dim tracking-[0.08em]">
         {isSpeaking
-          ? 'JARVIS SPEAKING \u00B7 MIC PAUSED \u00B7 ESC TO INTERRUPT'
+          ? 'JARVIS SPEAKING · MIC PAUSED · ESC TO INTERRUPT'
           : listening
           ? voiceMode === 'cold'
-            ? 'SAY \u201CJARVIS\u201D TO ACTIVATE \u00B7 ESC TO INTERRUPT'
-            : 'CONVERSATION MODE \u00B7 SPEAK FREELY \u00B7 ESC TO INTERRUPT'
-          : 'CLICK MIC TO SPEAK \u00B7 ENTER TO SEND \u00B7 ESC TO INTERRUPT'}
+            ? 'SAY “JARVIS” TO ACTIVATE · ESC TO INTERRUPT'
+            : 'CONVERSATION MODE · SPEAK FREELY · ESC TO INTERRUPT'
+          : 'CLICK MIC TO SPEAK · ENTER TO SEND · ESC TO INTERRUPT'}
       </div>
     </div>
   );

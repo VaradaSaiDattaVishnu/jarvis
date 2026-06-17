@@ -1,8 +1,69 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const { z } = require('zod');
 const EmbeddingService = require('./embeddings');
 const EncryptionService = require('./encryption');
+const { formatDateTime } = require('./timeparser');
+
+// ─── Consolidated post-turn extraction schema ───────────────────────────
+// One typed structured-output call replaces the eight separate LLM calls that
+// used to fire after every reply (memories, profile, relationships, tasks,
+// preferences, entities, mood, follow-ups). Every field is optional/defaulted so
+// the model can omit sections and the result still validates — partial output is
+// fine, and one bad section never loses the others.
+const EXTRACTION_SCHEMA = z.object({
+  memories: z.array(z.object({
+    category: z.enum(['fact', 'preference', 'event', 'relationship', 'emotion', 'routine']).default('fact'),
+    content: z.string().describe('a concise standalone sentence about the user'),
+    keywords: z.string().describe('comma-separated search terms'),
+    importance: z.number().min(1).max(5).default(2).describe('5=name/identity, 4=life events, 3=preferences, 2=opinions, 1=minor'),
+    expires: z.string().nullable().default(null).describe('ISO date if temporary (e.g. "on vacation until Fri"), else null'),
+  })).default([]).describe('long-term facts worth remembering about the user; [] if none'),
+  profile: z.object({
+    name: z.string().optional(),
+    job: z.string().optional(),
+    location: z.string().optional(),
+    interests: z.array(z.string()).optional(),
+    goals: z.array(z.string()).optional(),
+    communication_style: z.string().optional(),
+  }).default({}).describe('only NEW/changed profile fields from this exchange'),
+  relationships: z.array(z.object({
+    name: z.string(),
+    relationship: z.string().nullable().default(null),
+    context: z.string().nullable().default(null),
+  })).default([]).describe('people mentioned; [] if none'),
+  tasks: z.array(z.object({
+    content: z.string(),
+    priority: z.enum(['low', 'medium', 'high']).default('medium'),
+    due_date: z.string().nullable().default(null),
+  })).default([]).describe('todos/commitments the user expressed ("I need to…", deadlines); [] if none'),
+  preferences: z.array(z.object({
+    category: z.string(),
+    preference: z.string(),
+    source: z.enum(['explicit', 'implicit']).default('implicit'),
+    confidence: z.number().min(0).max(1).default(0.6),
+  })).default([]).describe('user likes/dislikes; [] if none'),
+  entities: z.array(z.object({
+    name: z.string(),
+    type: z.string().describe('person/place/organization/date/product/event'),
+    attributes: z.string().nullable().default(null),
+  })).default([]).describe('notable named entities; [] if none'),
+  mood: z.object({
+    mood: z.enum(['happy', 'sad', 'stressed', 'anxious', 'frustrated', 'excited', 'neutral', 'tired', 'angry', 'curious']).default('neutral'),
+    intensity: z.number().min(0).max(1).default(0.3),
+    triggers: z.string().default(''),
+  }).default({ mood: 'neutral', intensity: 0.3, triggers: '' }).describe("the user's emotional tone in their message"),
+  followUps: z.array(z.object({
+    topic: z.string(),
+    context: z.string().default(''),
+    check_after_hours: z.number().min(1).max(336).default(24),
+  })).default([]).describe('things worth checking in on later (events, decisions, health, interviews); [] if none'),
+});
+
+const EXTRACTION_SYSTEM = `You analyze one conversation exchange and extract structured information about the user to remember.
+Capture the user's name/identity as a memory with importance 5 whenever they introduce themselves.
+Only include profile fields that are NEW or changed in this exchange. Use empty arrays / "neutral" mood when a section has nothing.`;
 
 // Persistent data dir (set DATA_DIR to a mounted volume in production so the
 // SQLite DB survives redeploys). Falls back to the project root for local dev.
@@ -980,6 +1041,97 @@ If no notable entities, return [].`,
       if (!(e instanceof SyntaxError)) console.error('Entity extraction failed:', e.message);
       return 0;
     }
+  }
+
+  // ─── Consolidated post-turn extraction (ONE LLM call) ─────────────────
+  // Supersedes the eight separate post-turn extractors. Makes a single typed
+  // structured-output call (via llm.extractStructured), then fans the parsed
+  // result into the existing storage primitives. This is the main latency/cost
+  // fix: the old fan-out fired 8 LLM calls per turn, which on Groq's 12k-TPM
+  // free tier tripped 429s and made the *next* turn crawl (the "razor fast →
+  // slow" regression), and on Claude cost ~8x per turn. moodService is passed in
+  // so the mood lands in mood_log (read by getMoodContext on the next turn).
+  async extractAndStore(llmService, userMsg, assistantMsg, sessionId, moodService = null) {
+    const profile = this.getProfile();
+    const profileNote = Object.keys(profile).length
+      ? `\n\nKnown profile (only return fields that change): ${JSON.stringify(profile)}`
+      : '';
+    const exchange = `user: ${userMsg}\nassistant: ${assistantMsg}`;
+
+    let data;
+    try {
+      data = await llmService.extractStructured(EXTRACTION_SYSTEM + profileNote, exchange, EXTRACTION_SCHEMA, { useMainModel: true });
+    } catch (e) {
+      console.error('❌ Consolidated extraction failed:', e.message);
+      return;
+    }
+    if (!data || typeof data !== 'object') return;
+
+    // Each section is guarded independently so one malformed part can't drop the
+    // rest. All writes are cheap local SQLite ops.
+    try {
+      let stored = 0;
+      for (const m of data.memories || []) {
+        if (!m.content || !m.keywords) continue;
+        try {
+          const contradictions = await this.findContradiction(m.content);
+          if (contradictions && contradictions.length > 0) {
+            const top = contradictions.sort((a, b) => b.similarity - a.similarity)[0];
+            await this.replaceMemory(top.id, m.content, m.keywords);
+            stored++;
+            continue;
+          }
+          if (await this.isDuplicate(m.content)) continue;
+          await this.storeMemory(m.category || 'fact', m.content, m.keywords, m.importance || 2, m.expires || null);
+          stored++;
+        } catch (itemErr) { /* skip malformed item */ }
+      }
+      if (stored > 0) console.log(`💾 Extracted ${stored} new memor${stored === 1 ? 'y' : 'ies'}`);
+    } catch (e) { console.error('memory section failed:', e.message); }
+
+    try {
+      const entries = Object.entries(data.profile || {}).filter(([, v]) => v != null && !(Array.isArray(v) && v.length === 0));
+      for (const [k, v] of entries) this.updateProfile(k, typeof v === 'string' ? v : JSON.stringify(v));
+      if (entries.length) console.log(`👤 Updated ${entries.length} profile field(s): ${entries.map(([k]) => k).join(', ')}`);
+    } catch (e) { console.error('profile section failed:', e.message); }
+
+    try {
+      let n = 0;
+      for (const p of data.relationships || []) { if (p.name) { this.upsertRelationship(p.name, p.relationship || null, p.context || null); n++; } }
+      if (n) console.log(`👥 Tracked ${n} relationship(s)`);
+    } catch (e) { console.error('relationships section failed:', e.message); }
+
+    try {
+      let n = 0;
+      for (const t of data.tasks || []) { if (t.content) { this.createTask(t.content, t.priority || 'medium', t.due_date || null); n++; } }
+      if (n) console.log(`✅ Tracked ${n} task(s)`);
+    } catch (e) { console.error('tasks section failed:', e.message); }
+
+    try {
+      for (const p of data.preferences || []) { if (p.category && p.preference) this.upsertPreference(p.category, p.preference, p.source || 'implicit', p.confidence ?? 0.6); }
+    } catch (e) { console.error('preferences section failed:', e.message); }
+
+    try {
+      for (const en of data.entities || []) { if (en.name && en.type) this.upsertEntity(en.name, en.type, en.attributes || null); }
+    } catch (e) { console.error('entities section failed:', e.message); }
+
+    try {
+      let n = 0;
+      for (const f of data.followUps || []) {
+        if (!f.topic) continue;
+        const checkAfter = formatDateTime(new Date(Date.now() + (f.check_after_hours || 24) * 3600000));
+        this.createFollowUp(f.topic, f.context || '', checkAfter);
+        n++;
+      }
+      if (n) console.log(`🔔 Created ${n} follow-up(s)`);
+    } catch (e) { console.error('follow-ups section failed:', e.message); }
+
+    try {
+      if (moodService && data.mood && data.mood.mood) {
+        moodService.logMood(sessionId, data.mood.mood, data.mood.intensity ?? 0.5, data.mood.triggers || '');
+        if (data.mood.mood !== 'neutral') console.log(`😊 Mood: ${data.mood.mood} (${data.mood.intensity})`);
+      }
+    } catch (e) { console.error('mood section failed:', e.message); }
   }
 
   // ─── Session Summarization ────────────────────────────────

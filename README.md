@@ -81,15 +81,17 @@ Try: *"remind me to call mom tomorrow at 5pm"*, *"what's on my calendar today?"*
 React + Zustand (Web Speech API)
         │  WebSocket (stream text + audio + tool events)
         ▼
-Node.js / Express  ──► llm.js      agentStream(): multi-turn tool-calling loop
+Node.js / Express  ──► llm.js      LangChain.js — ChatAnthropic/ChatGroq, bindTools
+                   │               + streaming agent loop, structured extraction
                    ├─► tools.js     ~20 callable tools, exposed by what's connected
-                   ├─► rag.js       chunk → embed → vector search over docs
-                   ├─► memory.js    SQLite: memory, profile, tasks, notes, follow-ups
+                   ├─► rag.js       LangChain RAG — splitter → MiniLM embed → vector store
+                   ├─► memory.js    SQLite + ONE consolidated extraction call per turn
                    ├─► briefing.js  proactive suggestions + morning briefing
                    └─► tts.js       Edge TTS (clause-level streaming for low latency)
 
-LLM provider auto-detected: Anthropic key → Claude (claude-sonnet-4-6),
-otherwise Groq (llama-3.3-70b-versatile).
+LLM provider auto-detected via LangChain: Anthropic key → Claude (claude-sonnet-4-6),
+otherwise Groq (llama-3.3-70b-versatile). Documents embed locally with
+all-MiniLM-L6-v2 (no embedding API cost).
 ```
 
 ---

@@ -931,15 +931,15 @@ wss.on('connection', (ws) => {
         if (fullResponse.trim() && !privacy.isOffTheRecord(sessionId)) {
           memory.saveMessage(sessionId, 'assistant', fullResponse);
 
-          // Async background tasks (non-blocking)
-          memory.extractMemoriesFromExchange(llm, userText, fullResponse).catch(e => console.error('❌ Memory extraction error:', e.message));
-          memory.updateUserModel(llm, userText, fullResponse).catch(e => console.error('❌ Profile update error:', e.message));
-          mood.analyzeMood(llm, sessionId, userText).catch(e => console.error('❌ Mood analysis error:', e.message));
-          memory.extractRelationships(llm, userText, fullResponse).catch(e => console.error('❌ Relationship extraction error:', e.message));
-          memory.extractTasks(llm, userText, fullResponse).catch(e => console.error('❌ Task extraction error:', e.message));
-          memory.extractPreferences(llm, userText, fullResponse).catch(e => console.error('❌ Preference extraction error:', e.message));
-          memory.extractEntities(llm, userText, fullResponse).catch(e => console.error('❌ Entity extraction error:', e.message));
-          followUp.detectFollowUpOpportunity(llm, userText, fullResponse).catch(e => console.error('❌ Follow-up detection error:', e.message));
+          // Async background extraction (non-blocking): ONE consolidated
+          // structured-output call replaces the previous EIGHT separate LLM
+          // calls (memories, profile, mood, relationships, tasks, preferences,
+          // entities, follow-ups). The per-turn fan-out was the main latency
+          // regression — on Groq's 12k-TPM free tier it tripped 429s that slowed
+          // the next turn; on Claude it was ~8x the per-turn cost. See
+          // memory.extractAndStore().
+          memory.extractAndStore(llm, userText, fullResponse, sessionId, mood)
+            .catch(e => console.error('❌ Background extraction error:', e.message));
         }
 
       } catch (error) {
@@ -947,12 +947,14 @@ wss.on('connection', (ws) => {
           // Aborted mid-stream — already handled by the interrupt path.
         } else {
           console.error('❌ Error:', error.message);
-          ws.send(JSON.stringify({
-            type: 'error',
-            message: (error.message || '').match(/api_?key|authentication|API key/i)
-              ? `Invalid ${llm.displayName} API key. Check your configuration.`
-              : 'Something went wrong. Try again.',
-          }));
+          const em = error.message || '';
+          let friendly = 'Something went wrong. Try again.';
+          if (/api_?key|authentication|API key/i.test(em)) {
+            friendly = `Invalid ${llm.displayName} API key. Check your configuration.`;
+          } else if (/\b429\b|rate.?limit|tokens per minute|TPM/i.test(em)) {
+            friendly = `I've hit a temporary rate limit on ${llm.displayName}'s free tier — give me a few seconds and try again.`;
+          }
+          ws.send(JSON.stringify({ type: 'error', message: friendly }));
         }
       } finally {
         // Only the owning request clears shared state — a turn that started after
