@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    /* What JS features to emit/allow. ES2022 is well-supported on Node 18+. */
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    /* Modern ESM. "Bundler" resolution lets us write clean extensionless
+       imports (./app instead of ./app.js), which tsx resolves at runtime. */
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    /* Only Node globals are ambient; everything else is imported explicitly. */
+    "types": ["node"],
+
+    /* Safety: strict turns on the full bug-catching ruleset. */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    /* Ergonomics. */
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* We run TypeScript directly via tsx, so tsc only type-checks. */
+    "noEmit": true
+  },
+  "include": ["src"]
+}
