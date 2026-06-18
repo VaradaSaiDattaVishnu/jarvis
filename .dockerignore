@@ -1,0 +1,10 @@
+# Keep the build context small and correct. In particular, NEVER copy local
+# node_modules — they hold macOS-native binaries (better-sqlite3, onnxruntime)
+# that would break in the Linux image; the image installs fresh ones instead.
+**/node_modules
+**/dist
+server/data
+.git
+*.log
+.env
+**/.env

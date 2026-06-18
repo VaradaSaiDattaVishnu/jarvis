@@ -1,3 +1,13 @@
+---
+title: JARVIS
+emoji: 🤖
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # JARVIS — Agentic AI Voice Assistant
 
 A voice-first personal assistant built on a **LangChain v1 tool-calling agent**. You speak
@@ -8,6 +18,8 @@ sessions, and replies out loud.
 This is a learning-grade but production-deployable implementation. The priority is
 **readable code over clever code** — every architectural decision is made deliberately and
 documented.
+
+> The YAML block at the top configures the Hugging Face **Docker Space** that hosts this app.
 
 ## Architecture
 
@@ -54,7 +66,7 @@ documented.
 - [x] **⑤  Memory** — conversation history + durable facts
 - [x] **⑥  Voice** — Groq Whisper speech-to-text + spoken replies
 - [x] **⑦  Frontend** — React mic + chat UI
-- [x] **⑧  Deploy** — one Node service serves the API + built frontend (any Node host)
+- [x] **⑧  Deploy** — one Node service serves the API + built frontend (Hugging Face Docker Space)
 
 ## Run the full app (local)
 
@@ -80,17 +92,14 @@ Drop `.txt`/`.md` files into `server/data/documents/`, then run `npm run ingest`
 `server/`). Now ask about them — the agent calls `document_search` and answers with the
 source cited.
 
-## Deploy
+## Deploy (Hugging Face Docker Space)
 
-The app deploys as **one Node service** that builds the React frontend and serves it on the
-same origin as the API (no CORS, one URL) — so it runs on any Node host:
+The app builds as one Docker image (`Dockerfile`) that compiles the frontend and runs the
+server, serving both on `app_port` 7860.
 
-- **Build:** `npm run build` (root) → installs deps and builds `web/` into `web/dist`
-- **Start:** `npm start` (root) → runs the server, which serves `web/dist` + the API
-- **Env:** `ANTHROPIC_API_KEY` (required); `GROQ_API_KEY` (voice) and `TAVILY_API_KEY`
-  (search) optional.
-- **Runtime:** Node ≥20 (see `.nvmrc`); the server listens on `process.env.PORT`.
+1. Create a **Docker** Space, then push this branch to it (`git push space staging:main`).
+2. Set `ANTHROPIC_API_KEY` (required), and optionally `GROQ_API_KEY` / `TAVILY_API_KEY`, as
+   **Space secrets**.
 
-> **Storage note:** SQLite lives on the instance's local disk. On an ephemeral filesystem it
-> resets on redeploy/restart (re-run `npm run ingest`; remembered facts reset too). Attach a
-> persistent volume for durable storage.
+> **Storage note:** SQLite lives on the Space's ephemeral disk — ingested docs and remembered
+> facts reset on restart/rebuild. Chat, tools, and voice are unaffected.
