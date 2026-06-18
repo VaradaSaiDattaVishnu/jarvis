@@ -54,7 +54,7 @@ documented.
 - [x] **⑤  Memory** — conversation history + durable facts
 - [x] **⑥  Voice** — Groq Whisper speech-to-text + spoken replies
 - [x] **⑦  Frontend** — React mic + chat UI
-- [x] **⑧  Deploy** — one Node service serves the API + built frontend (Render-ready)
+- [x] **⑧  Deploy** — one Node service serves the API + built frontend (any Node host)
 
 ## Run the full app (local)
 
@@ -83,15 +83,14 @@ source cited.
 ## Deploy
 
 The app deploys as **one Node service** that builds the React frontend and serves it on the
-same origin as the API (no CORS, one URL):
+same origin as the API (no CORS, one URL) — so it runs on any Node host:
 
-- `npm run build` (root) → installs deps and builds `web/` into `web/dist`
-- `npm start` (root) → runs the server, which serves `web/dist` + the API
+- **Build:** `npm run build` (root) → installs deps and builds `web/` into `web/dist`
+- **Start:** `npm start` (root) → runs the server, which serves `web/dist` + the API
+- **Env:** `ANTHROPIC_API_KEY` (required); `GROQ_API_KEY` (voice) and `TAVILY_API_KEY`
+  (search) optional.
+- **Runtime:** Node ≥20 (see `.nvmrc`); the server listens on `process.env.PORT`.
 
-A [`render.yaml`](./render.yaml) blueprint is included for one-click deploy on
-[Render](https://render.com). Set `ANTHROPIC_API_KEY` (required) and optionally
-`GROQ_API_KEY` (voice) / `TAVILY_API_KEY` (search) in the dashboard.
-
-> **Storage note:** SQLite lives on the instance's local disk. On a free/ephemeral
-> filesystem it resets on redeploy/restart (re-run `npm run ingest`; remembered facts reset
-> too). Attach a persistent disk for durable storage.
+> **Storage note:** SQLite lives on the instance's local disk. On an ephemeral filesystem it
+> resets on redeploy/restart (re-run `npm run ingest`; remembered facts reset too). Attach a
+> persistent volume for durable storage.
