@@ -1,11 +1,12 @@
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
-import { rememberFact, recallFacts } from "../../memory/store";
+import { rememberFact } from "../../memory/store";
 
 /**
- * Long-term memory exposed as two tools. This is the LONG-TERM half of memory
- * (durable facts across conversations) — distinct from the conversation
- * checkpointer in agent.ts, which is the SHORT-TERM, per-thread history.
+ * Long-term memory: durable facts across conversations — distinct from the
+ * conversation checkpointer in agent.ts, which is the SHORT-TERM, per-thread
+ * history. Only the *save* side is a tool (remember_fact); *recall* is always-on,
+ * injected into the system prompt by the agent, so there's no recall tool here.
  */
 
 export const rememberFactTool = tool(
@@ -20,19 +21,5 @@ export const rememberFactTool = tool(
     schema: z.object({
       fact: z.string().describe("The fact to remember, as a short sentence"),
     }),
-  },
-);
-
-export const recallFactsTool = tool(
-  async () => {
-    const facts = recallFacts();
-    if (facts.length === 0) return "I don't have any saved facts about the user yet.";
-    return "Here is what I remember about the user:\n" + facts.map((f) => `- ${f}`).join("\n");
-  },
-  {
-    name: "recall_facts",
-    description:
-      "Retrieve everything you've saved about the user. Use this to personalize an answer, or when the user asks what you remember about them.",
-    schema: z.object({}),
   },
 );

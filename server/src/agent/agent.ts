@@ -1,8 +1,9 @@
-import { createAgent } from "langchain";
+import { createAgent, dynamicSystemPromptMiddleware } from "langchain";
 import { MemorySaver } from "@langchain/langgraph";
 import { HumanMessage } from "@langchain/core/messages";
 import { createChatModel } from "./model";
 import { tools } from "./tools";
+import { recallFacts } from "../memory/store";
 
 /**
  * JARVIS's persona + behavioural instructions.
@@ -13,8 +14,8 @@ const SYSTEM_PROMPT =
   "Use the available tools when they would help answer accurately. " +
   "For questions about the user's own documents or notes, use document_search " +
   "and cite the source filename(s). " +
-  "When the user shares a durable fact about themselves, save it with remember_fact; " +
-  "use recall_facts when you need to personalize a reply. " +
+  "To summarise a whole document, use summarize_document with its filename. " +
+  "When the user shares a durable fact about themselves, save it with remember_fact. " +
   "Because your replies are spoken aloud, keep them short and natural — " +
   "a sentence or two, no markdown, no bullet lists.";
 
@@ -27,12 +28,27 @@ const SYSTEM_PROMPT =
  * The `checkpointer` is SHORT-TERM (conversation) memory: MemorySaver stores each
  * thread's message history in-process, keyed by `thread_id`. Because of it, every
  * /chat call sends only the NEW message — LangChain replays the rest of the thread.
- * (LONG-TERM memory — durable facts — lives separately in SQLite via the memory tools.)
+ * (LONG-TERM memory — durable facts — lives separately in SQLite. JARVIS *saves*
+ * them with the remember_fact tool; *recall* is always-on, injected below.)
  */
 const agent = createAgent({
   model: createChatModel(),
   tools,
   systemPrompt: SYSTEM_PROMPT,
+  middleware: [
+    // Always-on fact recall. This re-runs every turn at model-call time, so a fact
+    // saved this turn is visible on the very next one — no waiting, no tool call.
+    // Crucially, setting the prompt HERE (rather than prepending a SystemMessage to
+    // the input) means the facts never get checkpointed into the thread history, so
+    // they don't pile up or drift as the conversation grows — each call gets exactly
+    // one fresh copy of the current facts.
+    dynamicSystemPromptMiddleware(() => {
+      const facts = recallFacts();
+      if (facts.length === 0) return SYSTEM_PROMPT;
+      const knownFacts = facts.map((fact) => `- ${fact}`).join("\n");
+      return `${SYSTEM_PROMPT}\n\nKnown facts about the user:\n${knownFacts}`;
+    }),
+  ],
   checkpointer: new MemorySaver(),
 });
 

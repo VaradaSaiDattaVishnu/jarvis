@@ -13,16 +13,180 @@ body {
   max-width: 640px;
   margin: 0 auto;
   padding: 24px;
-  min-height: 100vh;
+  min-height: 100vh; /* fallback for old browsers */
+  min-height: 100dvh; /* resizes with the mobile URL bar — no jump */
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
 }
 
+/* Title + "New chat" on one row: title left, button right, baselines aligned.
+   The 8px gap that used to live on the h1 moves here so the row stays level. */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
 h1 {
   font-size: 1.3rem;
   font-weight: 600;
-  margin: 0 0 8px;
+  margin: 0;
+}
+
+/* Title + connectivity dot + its label, grouped on the left of the header. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Connectivity dot. Colour is set by the state modifier below; the smooth
+   transition only touches `background` so it can't cause any layout shift. */
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #8a8f98; /* default/grey, overridden per-state */
+  transition: background 0.2s ease;
+  flex: none; /* never let it squish on a tight header */
+}
+
+.dot.connecting {
+  background: #8a8f98; /* grey — waiting on the first /health reading */
+}
+
+.dot.online {
+  background: #2ecc71; /* green — last request reached the server */
+}
+
+.dot.offline {
+  background: #e0245e; /* red — last request failed */
+}
+
+/* Tiny muted caption next to the dot ("Online" / "Offline" / "Connecting…"). */
+.online-label {
+  font-size: 0.8rem;
+  color: #8a8f98;
+}
+
+/* Subdued "ghost" button — deliberately quieter than the primary blue Send so
+   the eye still lands on the composer, not here. */
+.new-chat {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  background: transparent;
+  color: #8a8f98;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.new-chat:hover {
+  color: #e6e6e6;
+  border-color: #3a4150;
+}
+
+/* Right-side header controls grouped together so the header's space-between
+   keeps the brand on the left and these on the right. */
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Wake-word toggle. Shares the quiet "ghost" look of .new-chat; when armed it
+   turns green with a small pulsing dot — a clear "the mic is live" signal,
+   which matters for an opt-in always-listening control. */
+.wake-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  background: transparent;
+  color: #8a8f98;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.wake-toggle:not(:disabled):hover {
+  color: #e6e6e6;
+  border-color: #3a4150;
+}
+
+/* Armed: green tint + label so it's unmistakable the mic is listening. */
+.wake-toggle.on {
+  color: #2ecc71;
+  border-color: rgba(46, 204, 113, 0.5);
+  background: rgba(46, 204, 113, 0.08);
+}
+
+/* Pulsing "live" dot before the label, shown only while armed. */
+.wake-toggle.on::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #2ecc71;
+  animation: wake-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes wake-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.wake-toggle:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Ingested-document chips: a compact, muted row under the header. Wraps on
+   narrow screens; deliberately quiet so it never competes with the chat. */
+.docs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+/* One document chip. Same border/bg vocabulary as the other ghost controls. */
+.doc {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid #2a2f3a;
+  background: #161a21;
+  color: #8a8f98;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis; /* long filenames truncate instead of stretching the row */
+}
+
+/* The chunk count, set apart as a smaller badge within the chip. */
+.doc-chunks {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #20242c;
+  color: #b8bdc7;
+  font-size: 0.7rem;
 }
 
 .messages {
@@ -32,10 +196,83 @@ h1 {
   gap: 10px;
   padding: 12px 0;
   overflow-y: auto;
+  /* Transparent ring by default so the drop-target highlight (which only swaps
+     the color + bg) can't change the box size → no layout shift on dragover. */
+  border-radius: 12px;
+  outline: 2px dashed transparent;
+  outline-offset: -2px; /* inset, so the dashed ring stays inside the scroll area */
+  transition:
+    outline-color 0.15s ease,
+    background 0.15s ease;
 }
 
-.hint {
+/* Drop-target highlight while a file hovers over the chat. Only color/bg change
+   (outline reserved above) — nothing reflows. */
+.messages.dragging {
+  outline-color: #2b6cff;
+  background: rgba(43, 108, 255, 0.06);
+}
+
+/* Reduced-motion: keep the highlight (it's meaningful feedback) but drop the
+   fade so it appears instantly. */
+@media (prefers-reduced-motion: reduce) {
+  .messages {
+    transition: none;
+  }
+}
+
+/* Empty state: vertically + horizontally centered in the message area, shown
+   only before the first message. `margin: auto` does the centering because the
+   parent `.messages` is a flex column that stretches to fill the screen. */
+.empty {
+  margin: auto;
+  text-align: center;
+  max-width: 360px;
+  padding: 0 16px;
+}
+
+.empty-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.empty-sub {
   color: #8a8f98;
+  margin: 0 0 16px;
+}
+
+/* Wrapping row of one-tap starter chips. */
+.examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+/* Quiet pill buttons that prefill the composer (see App.tsx). */
+.example {
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid #2a2f3a;
+  background: transparent;
+  color: #b8bdc7;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.example:hover {
+  background: #161a21;
+  border-color: #3a4150;
+  color: #e6e6e6;
+}
+
+.example:active {
+  transform: scale(0.97); /* transform-only press feedback — no reflow */
 }
 
 .msg {
@@ -65,15 +302,24 @@ h1 {
 
 .composer input {
   flex: 1;
+  min-width: 0; /* lets the input shrink instead of overflowing on ~360px */
   padding: 10px 12px;
   border-radius: 8px;
   border: 1px solid #2a2f3a;
   background: #161a21;
   color: #e6e6e6;
   font-size: 1rem;
+  transition: border-color 0.15s ease;
+}
+
+.composer input:focus {
+  outline: none;
+  border-color: #2b6cff; /* subtle focus ring via border, no layout shift */
 }
 
 .composer button {
+  /* min-height keeps a comfortable ~40px touch target on mobile. */
+  min-height: 40px;
   padding: 10px 14px;
   border-radius: 8px;
   border: none;
@@ -81,6 +327,23 @@ h1 {
   color: #fff;
   font-size: 1rem;
   cursor: pointer;
+  /* Animate only color/opacity/shadow + transform — never box metrics — so
+     hover/active feedback can't nudge the layout. */
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.05s ease;
+}
+
+/* Hover/active polish for the primary (Send) button. Skip :disabled so a
+   greyed-out button doesn't react to the cursor. */
+.composer button:not(:disabled):hover {
+  background: #4a83ff;
+  box-shadow: 0 2px 8px rgba(43, 108, 255, 0.35);
+}
+
+.composer button:not(:disabled):active {
+  transform: scale(0.96); /* transform-only press — no reflow */
 }
 
 .composer button:disabled {
@@ -88,6 +351,148 @@ h1 {
   cursor: default;
 }
 
+/* The mic (and the 📎 attach button, which also uses .mic) share the button
+   polish but get their own hover tint so they read as secondary controls rather
+   than a second Send. */
+.composer .mic:not(:disabled):hover {
+  background: #3a4150;
+  box-shadow: none;
+}
+
 .composer .mic.recording {
   background: #e0245e;
+}
+
+.composer .mic.recording:not(:disabled):hover {
+  background: #f0356f; /* keep the recording pink, just a touch brighter */
+}
+
+/* Subtle status strip above the composer (listening / transcribing). While
+   listening it lays out the label beside the live equalizer bars. */
+.status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+  color: #8a8f98;
+  padding: 4px 2px;
+  min-height: 24px; /* reserve the bars' height so nothing jumps */
+}
+
+.status-label {
+  white-space: nowrap;
+}
+
+/* Live equalizer bars driven by the mic analyser (see App.tsx tick()). */
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 20px;
+}
+
+.bar {
+  width: 4px;
+  height: 100%;
+  border-radius: 2px;
+  background: #2b6cff;
+  transform-origin: bottom; /* scaleY grows upward from the baseline */
+  transform: scaleY(0.12);
+  transition: transform 80ms linear; /* smooth between rAF samples */
+}
+
+/* Reduced-motion: drop the bars entirely — the "Listening…" text still says
+   we're capturing, so no meaning is lost. */
+@media (prefers-reduced-motion: reduce) {
+  .bars {
+    display: none;
+  }
+}
+
+/* "JARVIS is thinking…" bubble: three dots that pulse in sequence. Match a
+   normal assistant bubble's box exactly (same 10px 14px padding) and pin the
+   inner height to one text line (1.45em, matching .msg line-height) so the row
+   is the same height as a real reply — no list shift when it appears/vanishes. */
+.msg.thinking {
+  display: flex;
+  align-items: center;
+}
+
+.msg.thinking .dots {
+  height: 1.45em;
+}
+
+.dots {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #8a8f98;
+  animation: dot-pulse 1.2s ease-in-out infinite;
+}
+
+/* Stagger each dot so they ripple instead of pulsing in unison. */
+.dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes dot-pulse {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+/* Small spinner shown inside the Send button while busy. */
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- Mobile tightening (down to ~360px) ----------------------------------
+   Trim the generous desktop padding, let bubbles use more width, and keep the
+   composer on one row without overflow. The 640px max-width centering above
+   still applies on larger screens. */
+@media (max-width: 480px) {
+  .app {
+    padding: 16px 12px;
+  }
+
+  .msg {
+    max-width: 88%;
+  }
+
+  .composer {
+    gap: 6px;
+  }
+
+  .composer button {
+    padding: 10px 12px;
+  }
 }

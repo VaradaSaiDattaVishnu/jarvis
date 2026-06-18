@@ -10,6 +10,7 @@ export default defineConfig({
     proxy: {
       "/chat": "http://localhost:3001",
       "/transcribe": "http://localhost:3001",
+      "/documents": "http://localhost:3001",
       "/health": "http://localhost:3001",
     },
   },

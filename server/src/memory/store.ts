@@ -13,7 +13,10 @@ export function rememberFact(content: string): void {
   db.prepare("INSERT INTO memories (content) VALUES (?)").run(content);
 }
 
-/** Return every saved fact, newest first. */
+/**
+ * Return every saved fact, newest first. Called every turn by the agent's dynamic
+ * system prompt, which injects these into the prompt so recall is always-on.
+ */
 export function recallFacts(): string[] {
   const rows = db
     .prepare("SELECT content FROM memories ORDER BY id DESC")

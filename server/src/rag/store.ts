@@ -65,3 +65,27 @@ export function countChunks(): number {
   const row = db.prepare("SELECT COUNT(*) AS n FROM chunks").get() as { n: number };
   return row.n;
 }
+
+/**
+ * List every source file we hold, with its chunk count — one row per document.
+ * Powers the UI's "what's in the knowledge base?" view. We GROUP BY source so a
+ * file ingested as 12 chunks shows up once (chunks: 12), not twelve times.
+ */
+export function listSources(): { source: string; chunks: number }[] {
+  const rows = db
+    .prepare("SELECT source, COUNT(*) AS chunks FROM chunks GROUP BY source ORDER BY source")
+    .all() as Array<{ source: string; chunks: number }>;
+  return rows;
+}
+
+/**
+ * Every chunk of ONE source, in document order. Ordering by `id` (an autoincrement
+ * primary key) reproduces ingest order, which is reading order — so joining these
+ * back together reconstructs the original document for summarisation.
+ */
+export function getChunksBySource(source: string): string[] {
+  const rows = db
+    .prepare("SELECT content FROM chunks WHERE source = ? ORDER BY id")
+    .all(source) as Array<{ content: string }>;
+  return rows.map((row) => row.content);
+}

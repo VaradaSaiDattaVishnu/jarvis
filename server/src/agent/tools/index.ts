@@ -5,7 +5,8 @@ import { convertUnits } from "./units";
 import { convertCurrency } from "./currency";
 import { search } from "./search";
 import { documentSearch } from "./documents";
-import { rememberFactTool, recallFactsTool } from "./memory";
+import { summarizeDocument } from "./summarize";
+import { rememberFactTool } from "./memory";
 
 /**
  * The full tool set handed to the agent. Adding a capability is a small, obvious
@@ -20,6 +21,6 @@ export const tools = [
   convertCurrency,
   search,
   documentSearch,
+  summarizeDocument,
   rememberFactTool,
-  recallFactsTool,
 ];

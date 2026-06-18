@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { healthRouter } from "./routes/health";
 import { chatRouter } from "./routes/chat";
 import { transcribeRouter } from "./routes/transcribe";
+import { documentsRouter } from "./routes/documents";
 
 /**
  * Build and configure the Express application.
@@ -15,14 +16,16 @@ import { transcribeRouter } from "./routes/transcribe";
 export function buildApp() {
   const app = express();
 
-  // Parse JSON bodies for the chat API. (The /transcribe route opts into a raw
-  // body parser of its own, since it receives binary audio, not JSON.)
+  // Parse JSON bodies for the chat API. (The /transcribe and /documents routes
+  // opt into raw body parsers of their own, since they receive binary audio and
+  // raw file bytes respectively, not JSON.)
   app.use(express.json());
 
   // --- API routes (matched first, in order) ---
   app.use("/health", healthRouter);
   app.use("/chat", chatRouter);
   app.use("/transcribe", transcribeRouter);
+  app.use("/documents", documentsRouter);
 
   // --- Production: serve the built React app on the SAME origin as the API ---
   // One service hosts everything, so there's no CORS and the frontend's relative
