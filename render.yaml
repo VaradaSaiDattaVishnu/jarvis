@@ -1,0 +1,20 @@
+# Render Blueprint — one web service that builds the frontend and serves it
+# alongside the API. Deploy by pushing this repo and clicking "New + → Blueprint"
+# in Render, or configure a Web Service manually with the same build/start commands.
+services:
+  - type: web
+    name: jarvis
+    runtime: node
+    plan: free
+    buildCommand: npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ANTHROPIC_API_KEY # required — set the value in the Render dashboard
+        sync: false
+      - key: GROQ_API_KEY # optional — enables voice transcription
+        sync: false
+      - key: TAVILY_API_KEY # optional — enables web search
+        sync: false

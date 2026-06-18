@@ -1,0 +1,13 @@
+{
+  "name": "jarvis",
+  "private": true,
+  "version": "0.1.0",
+  "description": "JARVIS — agentic AI voice assistant (LangChain + Claude). Backend + React frontend.",
+  "scripts": {
+    "build": "npm --prefix web install --include=dev && npm --prefix web run build && npm --prefix server install --include=dev",
+    "start": "npm --prefix server start"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

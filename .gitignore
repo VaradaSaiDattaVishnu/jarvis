@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets — NEVER commit real keys
+.env
+.env.local
+*.local
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime data (SQLite db, uploaded docs, vectors) — added in later phases
+data/
+*.sqlite
+*.sqlite3
